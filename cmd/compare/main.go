@@ -2,13 +2,16 @@ package main
 
 import (
 	"bytes"
+	"crypto/sha256"
 	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
+	"hash"
 	"os"
 	"runtime"
+	"strings"
 	"time"
 
 	"github.com/consensys/gnark-crypto/ecc"
@@ -19,6 +22,7 @@ import (
 	"github.com/consensys/gnark/frontend"
 	"github.com/consensys/gnark/frontend/cs/scs"
 	csbn254 "github.com/consensys/gnark/internal/backend/bn254/cs"
+	dlinkzgbackend "github.com/consensys/gnark/internal/backend/bn254/dlinkzg"
 	gpianobn254 "github.com/consensys/gnark/internal/backend/bn254/gpiano"
 	witnessbn254 "github.com/consensys/gnark/internal/backend/bn254/witness"
 	plonkadapter "github.com/consensys/gnark/internal/benchadapter/plonk"
@@ -76,6 +80,199 @@ func boolMetric(value bool) float64 {
 		return 1
 	}
 	return 0
+}
+
+const (
+	dlinkzgCompareProtocolVersion = "dlinkzg-compare/v1"
+	dlinkzgSessionNonceDomain     = "DLinKZG/compare/session-nonce/v1"
+	dlinkzgProtocolOperations     = uint64(17)
+	dlinkzgProtocolHeaderBytes    = uint64(20)
+)
+
+func isPowerOfTwo64(value uint64) bool {
+	return value != 0 && value&(value-1) == 0
+}
+
+func isMPIWorkerProcess() bool {
+	return len(os.Args) > 1 && strings.EqualFold(os.Args[len(os.Args)-1], "slave")
+}
+
+// initializeMPIWorld must run after flags are parsed and before topology
+// validation. simpleMPI appends the master address, port, and "Slave" to the
+// worker command, so the normal flag parser has already consumed every
+// benchmark flag on both the root and workers.
+func initializeMPIWorld(cfg config) error {
+	if cfg.backend == "plonk" || os.Getenv("PIANIST_MPI_DISABLE") == "1" {
+		if isMPIWorkerProcess() {
+			return errors.New("single-process backend cannot run as an MPI worker")
+		}
+		mpi.SelfRank = 0
+		mpi.WorldSize = 1
+		return nil
+	}
+	if cfg.backend != "gpiano" && cfg.backend != "dlinkzg" {
+		return fmt.Errorf("unknown backend %q", cfg.backend)
+	}
+	if isMPIWorkerProcess() {
+		mpi.WorldInit("", "", "")
+		return nil
+	}
+	ipFile := os.Getenv("PIANIST_MPI_IP_FILE")
+	sshKey := os.Getenv("PIANIST_MPI_SSH_KEY")
+	sshUser := os.Getenv("PIANIST_MPI_SSH_USER")
+	if ipFile == "" || sshKey == "" || sshUser == "" {
+		return errors.New("distributed backend needs all PIANIST_MPI_* variables")
+	}
+	mpi.WorldInit(ipFile, sshKey, sshUser)
+	return nil
+}
+
+func writeHashUint64(hasher hash.Hash, value uint64) {
+	var encoded [8]byte
+	binary.BigEndian.PutUint64(encoded[:], value)
+	_, _ = hasher.Write(encoded[:])
+}
+
+func dlinkzgSessionNonce(cfg config, statementDigest dlinkzgbackend.TranscriptDigest) [32]byte {
+	hasher := sha256.New()
+	_, _ = hasher.Write([]byte(dlinkzgSessionNonceDomain))
+	_, _ = hasher.Write(statementDigest[:])
+	writeHashUint64(hasher, cfg.seed)
+	writeHashUint64(hasher, uint64(cfg.constraints))
+	writeHashUint64(hasher, cfg.workers)
+	var nonce [32]byte
+	copy(nonce[:], hasher.Sum(nil))
+	return nonce
+}
+
+func buildDLinKZGStatement(
+	metadata dlinkzgbackend.CompiledSetupMetadata,
+	publicValues []fr.Element,
+	cfg config,
+) (dlinkzgbackend.CompiledStatement, error) {
+	if len(publicValues) != metadata.PublicVariableCount {
+		return dlinkzgbackend.CompiledStatement{}, fmt.Errorf(
+			"dlinkzg public witness has %d values, setup expects %d",
+			len(publicValues), metadata.PublicVariableCount,
+		)
+	}
+	prefix := append([]fr.Element(nil), publicValues...)
+	statementDigest := dlinkzgbackend.CompiledPublicStatementDigest(prefix)
+	context := dlinkzgbackend.OuterTranscriptContext{
+		ProtocolVersion:       dlinkzgCompareProtocolVersion,
+		PublicStatementDigest: statementDigest,
+		SRSDigest:             metadata.SRSDigest,
+		IndexDigest:           metadata.IndexDigest,
+		IndexPrefixDigest:     metadata.IndexPrefixDigest,
+		ShiftCounter:          metadata.IndexShift.Counter,
+		Shift:                 metadata.IndexShift.Sigma,
+		PartyManifestDigest:   metadata.PartyManifestDigest,
+		SessionNonce:          dlinkzgSessionNonce(cfg, statementDigest),
+		PartitionCount:        uint64(metadata.PartitionCount),
+		LocalDomainSize:       uint64(metadata.LocalDomainSize),
+		LocalDomainGenerator:  metadata.LocalDomainGenerator,
+	}
+	return dlinkzgbackend.CompiledStatement{
+		PublicSolutionPrefix: prefix,
+		OuterContext:         context,
+	}, nil
+}
+
+func validateAndProvisionDLinKZGSetup(
+	setup *dlinkzgbackend.CompiledSetup,
+	mpiRank uint64,
+) (dlinkzgbackend.CompiledVerifyingKey, dlinkzgbackend.CompiledMPIRole, error) {
+	// ProvisionCompiledMPIRole is intentionally only an online O(M) check. A
+	// freshly generated or transported bundle must first cross the full O(MT)
+	// authenticated setup boundary.
+	if err := setup.Validate(); err != nil {
+		return dlinkzgbackend.CompiledVerifyingKey{}, dlinkzgbackend.CompiledMPIRole{}, err
+	}
+	return dlinkzgbackend.ProvisionCompiledMPIRole(setup, mpiRank)
+}
+
+func expectedDLinKZGRootAccounting(partitions uint64) (payloadSent, payloadReceived, wireSent, wireReceived uint64, err error) {
+	if partitions < 2 || !isPowerOfTwo64(partitions) {
+		return 0, 0, 0, 0, fmt.Errorf("invalid dlinkzg partition count %d", partitions)
+	}
+	logPartitions := uint64(0)
+	for value := partitions; value > 1; value >>= 1 {
+		logPartitions++
+	}
+	payloadReceived = partitions * 1440
+	payloadSent = partitions * (2016 + 192*logPartitions)
+	// Eight worker-to-root and nine root-to-worker records cross each star
+	// edge. Every ProtocolMPIChannel record has one fixed 20-byte header.
+	wireReceived = payloadReceived + partitions*8*dlinkzgProtocolHeaderBytes
+	wireSent = payloadSent + partitions*9*dlinkzgProtocolHeaderBytes
+	return payloadSent, payloadReceived, wireSent, wireReceived, nil
+}
+
+func dlinkzgCommunicationMetrics(
+	accounting dlinkzgbackend.ProtocolMPIAccounting,
+	partitions uint64,
+) (map[string]float64, error) {
+	wantPayloadSent, wantPayloadReceived, wantWireSent, wantWireReceived, err :=
+		expectedDLinKZGRootAccounting(partitions)
+	if err != nil {
+		return nil, err
+	}
+	if accounting.Rank != 0 || accounting.WorldSize != partitions+1 ||
+		accounting.PartitionCount != partitions || accounting.Operations != dlinkzgProtocolOperations {
+		return nil, fmt.Errorf("unexpected dlinkzg root accounting identity: %+v", accounting)
+	}
+	total := accounting.Total
+	if total.PayloadBytesSent != wantPayloadSent || total.PayloadBytesRecv != wantPayloadReceived ||
+		total.WireBytesSent != wantWireSent || total.WireBytesRecv != wantWireReceived {
+		return nil, fmt.Errorf(
+			"unexpected dlinkzg root byte accounting: got payload %d/%d wire %d/%d, want payload %d/%d wire %d/%d",
+			total.PayloadBytesSent, total.PayloadBytesRecv,
+			total.WireBytesSent, total.WireBytesRecv,
+			wantPayloadSent, wantPayloadReceived, wantWireSent, wantWireReceived,
+		)
+	}
+	return map[string]float64{
+		"bytes_sent":                               float64(total.PayloadBytesSent),
+		"bytes_received":                           float64(total.PayloadBytesRecv),
+		"setup_application_payload_bytes_sent":     0,
+		"setup_application_payload_bytes_received": 0,
+		"prove_application_payload_bytes_sent":     float64(total.PayloadBytesSent),
+		"prove_application_payload_bytes_received": float64(total.PayloadBytesRecv),
+		"prove_wire_bytes_sent":                    float64(total.WireBytesSent),
+		"prove_wire_bytes_received":                float64(total.WireBytesRecv),
+		"prove_framing_bytes_sent":                 float64(total.WireBytesSent - total.PayloadBytesSent),
+		"prove_framing_bytes_received":             float64(total.WireBytesRecv - total.PayloadBytesRecv),
+		"benchmark_sync_barriers":                  4,
+	}, nil
+}
+
+func dlinkzgArtifactMetrics(partitions uint64, encodedBytes int) (map[string]float64, error) {
+	g1Elements, fieldElements, err := dlinkzgbackend.CompiledProofElementCounts(partitions)
+	if err != nil {
+		return nil, err
+	}
+	wantEncodedBytes, err := dlinkzgbackend.CompiledProofEncodedSize(partitions)
+	if err != nil {
+		return nil, err
+	}
+	if encodedBytes != wantEncodedBytes {
+		return nil, fmt.Errorf("dlinkzg proof has %d encoded bytes, want %d", encodedBytes, wantEncodedBytes)
+	}
+	compressedPayloadBytes := g1Elements*bn254.SizeOfG1AffineCompressed + fieldElements*fr.Bytes
+	encodingOverheadBytes := encodedBytes - compressedPayloadBytes
+	if encodingOverheadBytes < 0 {
+		return nil, errors.New("dlinkzg proof encoding is smaller than its element inventory")
+	}
+	uncompressedProofBytes := g1Elements*bn254.SizeOfG1AffineUncompressed +
+		fieldElements*fr.Bytes + encodingOverheadBytes
+	return map[string]float64{
+		"proof_bytes":                   float64(encodedBytes),
+		"proof_bytes_compressed":        float64(encodedBytes),
+		"proof_bytes_uncompressed":      float64(uncompressedProofBytes),
+		"proof_encoding_overhead_bytes": float64(encodingOverheadBytes),
+		"proof_g1_elements":             float64(g1Elements),
+		"proof_field_elements":          float64(fieldElements),
+	}, nil
 }
 
 // synchronizeWorld is benchmark scaffolding, not part of either proof. It
@@ -206,11 +403,28 @@ func validateConfig(cfg config) error {
 	if cfg.workers == 0 {
 		return errors.New("workers must be positive")
 	}
-	if (cfg.backend == "gpiano" || cfg.backend == "dlinkzg") && cfg.workers != mpi.WorldSize {
+	if cfg.backend == "gpiano" && cfg.workers != mpi.WorldSize {
 		return fmt.Errorf("--workers=%d does not match MPI world size %d", cfg.workers, mpi.WorldSize)
+	}
+	if cfg.backend == "dlinkzg" {
+		if cfg.workers < 2 || !isPowerOfTwo64(cfg.workers) {
+			return fmt.Errorf("dlinkzg requires a power-of-two worker count M >= 2; got %d", cfg.workers)
+		}
+		if cfg.workers > uint64(^uint(0)>>1) {
+			return fmt.Errorf("dlinkzg worker count %d exceeds this platform's int range", cfg.workers)
+		}
+		if mpi.WorldSize != cfg.workers+1 {
+			return fmt.Errorf(
+				"dlinkzg --workers=%d requires MPI world size M+1=%d; got %d",
+				cfg.workers, cfg.workers+1, mpi.WorldSize,
+			)
+		}
 	}
 	if cfg.backend == "plonk" && (cfg.workers != 1 || mpi.WorldSize != 1) {
 		return fmt.Errorf("plonk requires --workers=1 and a single-process MPI world; got workers=%d world=%d", cfg.workers, mpi.WorldSize)
+	}
+	if cfg.backend != "gpiano" && cfg.backend != "dlinkzg" && cfg.backend != "plonk" {
+		return fmt.Errorf("unknown backend %q", cfg.backend)
 	}
 	return nil
 }
@@ -408,6 +622,220 @@ func runGPiano(cfg config) (adapterResult, error) {
 	return result, nil
 }
 
+func runDLinKZG(cfg config) (adapterResult, error) {
+	// AssertIsEqual contributes the final constraint, so the SCS realizes the
+	// requested global constraint count exactly.
+	steps := cfg.constraints - 1
+	circuit, witnessAssignment := assignment(cfg, steps)
+
+	compileStarted := time.Now()
+	ccs, err := frontend.Compile(ecc.BN254, scs.NewBuilder, circuit)
+	if err != nil {
+		return adapterResult{}, fmt.Errorf("compile circuit: %w", err)
+	}
+	compileElapsed := time.Since(compileStarted)
+	spr, ok := ccs.(*csbn254.SparseR1CS)
+	if !ok {
+		return adapterResult{}, fmt.Errorf("unexpected constraint system type %T", ccs)
+	}
+
+	// Every rank can construct the public statement. Only party ranks build
+	// and solve the private witness; coordinator rank zero passes no solution
+	// to CompiledProveMPI.
+	publicWitness, err := frontend.NewWitness(
+		witnessAssignment,
+		ecc.BN254,
+		frontend.PublicOnly(),
+	)
+	if err != nil {
+		return adapterResult{}, fmt.Errorf("build dlinkzg public witness: %w", err)
+	}
+	publicVector, ok := publicWitness.Vector.(*witnessbn254.Witness)
+	if !ok {
+		return adapterResult{}, fmt.Errorf("unexpected public witness vector type %T", publicWitness.Vector)
+	}
+	var privateWitnessVector *witnessbn254.Witness
+	if mpi.SelfRank != 0 {
+		fullWitness, witnessErr := frontend.NewWitness(witnessAssignment, ecc.BN254)
+		if witnessErr != nil {
+			return adapterResult{}, fmt.Errorf("build dlinkzg party witness: %w", witnessErr)
+		}
+		privateWitnessVector, ok = fullWitness.Vector.(*witnessbn254.Witness)
+		if !ok {
+			return adapterResult{}, fmt.Errorf("unexpected full witness vector type %T", fullWitness.Vector)
+		}
+	}
+
+	if err := synchronizeWorld(); err != nil {
+		return adapterResult{}, fmt.Errorf("synchronize before dlinkzg setup: %w", err)
+	}
+	setupBytesSentBefore := mpi.BytesSent
+	setupBytesReceivedBefore := mpi.BytesReceived
+	setupStarted := time.Now()
+	// These fixed nonzero trapdoors are deterministic benchmark inputs only.
+	// They deliberately do not depend on the witness seed, so setup remains
+	// reusable across benchmark trials for the same circuit shape.
+	tauY := fr.NewElement(1009)
+	tauZ := fr.NewElement(1019)
+	setup, err := dlinkzgbackend.NewDeterministicCompiledSetup(
+		spr, int(cfg.workers), tauY, tauZ,
+	)
+	if err != nil {
+		return adapterResult{}, fmt.Errorf("dlinkzg deterministic setup: %w", err)
+	}
+	metadata := setup.Metadata
+	vk, role, err := validateAndProvisionDLinKZGSetup(setup, mpi.SelfRank)
+	if err != nil {
+		return adapterResult{}, fmt.Errorf("provision dlinkzg MPI role: %w", err)
+	}
+	setupBytesSent := mpi.BytesSent - setupBytesSentBefore
+	setupBytesReceived := mpi.BytesReceived - setupBytesReceivedBefore
+	if setupBytesSent != 0 || setupBytesReceived != 0 {
+		return adapterResult{}, fmt.Errorf(
+			"dlinkzg deterministic setup unexpectedly used MPI: sent=%d received=%d",
+			setupBytesSent, setupBytesReceived,
+		)
+	}
+	if err := synchronizeWorld(); err != nil {
+		return adapterResult{}, fmt.Errorf("synchronize after dlinkzg setup: %w", err)
+	}
+	setupElapsed := time.Since(setupStarted)
+	// ProvisionCompiledMPIRole returned value-copied rank-local roles. The
+	// factory nevertheless materialized the complete bundle on every process;
+	// the result metrics below explicitly mark that setup/RSS limitation.
+	setup = nil
+
+	statement, err := buildDLinKZGStatement(metadata, []fr.Element(*publicVector), cfg)
+	if err != nil {
+		return adapterResult{}, err
+	}
+	proverConfig, err := gnarkbackend.NewProverConfig()
+	if err != nil {
+		return adapterResult{}, fmt.Errorf("build dlinkzg prover config: %w", err)
+	}
+
+	solveStarted := time.Now()
+	var partySolution []fr.Element
+	if mpi.SelfRank != 0 {
+		partySolution, err = spr.Solve([]fr.Element(*privateWitnessVector), proverConfig)
+		if err != nil {
+			return adapterResult{}, fmt.Errorf("dlinkzg party witness solve: %w", err)
+		}
+	}
+	if err := synchronizeWorld(); err != nil {
+		return adapterResult{}, fmt.Errorf("synchronize after dlinkzg witness solve: %w", err)
+	}
+	solveElapsed := time.Since(solveStarted)
+
+	channel, err := dlinkzgbackend.NewProtocolMPIChannel()
+	if err != nil {
+		return adapterResult{}, fmt.Errorf("build dlinkzg protocol channel: %w", err)
+	}
+	proveStarted := time.Now()
+	proof, err := dlinkzgbackend.CompiledProveMPI(
+		channel, vk, statement, role, partySolution,
+	)
+	if err != nil {
+		return adapterResult{}, fmt.Errorf("dlinkzg prove: %w", err)
+	}
+	accounting := channel.Accounting()
+	if err := synchronizeWorld(); err != nil {
+		return adapterResult{}, fmt.Errorf("synchronize after dlinkzg prove: %w", err)
+	}
+	proveCryptoElapsed := time.Since(proveStarted)
+	proveEndToEndElapsed := solveElapsed + proveCryptoElapsed
+
+	if mpi.SelfRank != 0 {
+		if proof != nil {
+			return adapterResult{}, errors.New("dlinkzg party rank returned a public proof")
+		}
+		if err := sendWorkerResourceSample(); err != nil {
+			return adapterResult{}, fmt.Errorf("send dlinkzg worker resource sample: %w", err)
+		}
+		return adapterResult{}, nil
+	}
+	if proof == nil {
+		return adapterResult{}, errors.New("dlinkzg coordinator returned no proof")
+	}
+
+	verifyStarted := time.Now()
+	if err := dlinkzgbackend.CompiledVerify(vk, statement, *proof); err != nil {
+		return adapterResult{}, fmt.Errorf("dlinkzg verify: %w", err)
+	}
+	verifyElapsed := time.Since(verifyStarted)
+	encodedProof, err := proof.MarshalBinary(cfg.workers)
+	if err != nil {
+		return adapterResult{}, fmt.Errorf("serialize dlinkzg proof: %w", err)
+	}
+	artifacts, err := dlinkzgArtifactMetrics(cfg.workers, len(encodedProof))
+	if err != nil {
+		return adapterResult{}, err
+	}
+	communication, err := dlinkzgCommunicationMetrics(accounting, cfg.workers)
+	if err != nil {
+		return adapterResult{}, err
+	}
+	coordinatorPeakRSS, workerPeakRSS, rankSumPeakRSS, supportedRSSRanks, err := collectRootResourceSamples()
+	if err != nil {
+		return adapterResult{}, fmt.Errorf("collect dlinkzg resource samples: %w", err)
+	}
+
+	var memory runtime.MemStats
+	runtime.ReadMemStats(&memory)
+	_, _, publicVariables := ccs.GetNbVariables()
+	if publicVariables != metadata.PublicVariableCount {
+		return adapterResult{}, fmt.Errorf(
+			"dlinkzg public variable mismatch: circuit=%d setup=%d",
+			publicVariables, metadata.PublicVariableCount,
+		)
+	}
+	localDomainSize := uint64(metadata.LocalDomainSize)
+	logPartitions := uint64(0)
+	for value := cfg.workers; value > 1; value >>= 1 {
+		logPartitions++
+	}
+	return adapterResult{
+		Timings: map[string]float64{
+			"compile":             milliseconds(compileElapsed),
+			"setup":               milliseconds(setupElapsed),
+			"setup_including_srs": milliseconds(setupElapsed),
+			"witness_solve":       milliseconds(solveElapsed),
+			"prove":               milliseconds(proveCryptoElapsed),
+			"prove_crypto_wall":   milliseconds(proveCryptoElapsed),
+			"prove_end_to_end":    milliseconds(proveEndToEndElapsed),
+			"verify":              milliseconds(verifyElapsed),
+		},
+		Communication: communication,
+		Artifacts:     artifacts,
+		Resources: map[string]float64{
+			"heap_alloc_bytes":              float64(memory.Alloc),
+			"heap_sys_bytes":                float64(memory.HeapSys),
+			"peak_rss_coordinator_bytes":    float64(coordinatorPeakRSS),
+			"peak_rss_worker_max_bytes":     float64(workerPeakRSS),
+			"peak_rss_rank_sum_bytes":       float64(rankSumPeakRSS),
+			"peak_rss_supported_rank_count": float64(supportedRSSRanks),
+		},
+		Operations: map[string]float64{
+			"requested_constraints":      float64(cfg.constraints),
+			"realized_constraints":       float64(ccs.GetNbConstraints()),
+			"public_variables":           float64(publicVariables),
+			"partitions":                 float64(cfg.workers),
+			"mpi_world_size":             float64(mpi.WorldSize),
+			"coordinator_only_ranks":     1,
+			"local_domain_size":          float64(localDomainSize),
+			"global_padded_rows":         float64(localDomainSize * cfg.workers),
+			"quotient_domain_size":       float64(4 * localDomainSize),
+			"sumcheck_rounds":            float64(logPartitions),
+			"protocol_operations":        float64(accounting.Operations),
+			"deterministic_setup":        1,
+			"setup_full_bundle_per_rank": 1,
+			"publication_ready_setup":    0,
+			"publication_ready_peak_rss": 0,
+		},
+		Verification: verification{Accepted: true},
+	}, nil
+}
+
 func runPLONK(cfg config) (adapterResult, error) {
 	measured, err := plonkadapter.Run(plonkadapter.Config{
 		Constraints: cfg.constraints,
@@ -478,7 +906,7 @@ func run(cfg config) (adapterResult, error) {
 	case "plonk":
 		return runPLONK(cfg)
 	case "dlinkzg":
-		return adapterResult{}, fmt.Errorf("backend %q is not wired yet", cfg.backend)
+		return runDLinKZG(cfg)
 	default:
 		return adapterResult{}, fmt.Errorf("unknown backend %q", cfg.backend)
 	}
@@ -486,6 +914,10 @@ func run(cfg config) (adapterResult, error) {
 
 func main() {
 	cfg := parseConfig()
+	if err := initializeMPIWorld(cfg); err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(1)
+	}
 	result, err := run(cfg)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
