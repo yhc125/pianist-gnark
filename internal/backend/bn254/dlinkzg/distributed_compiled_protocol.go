@@ -1224,11 +1224,16 @@ func compiledMPIOpeningU0Share(
 	var state compiledMPIOpeningPartyState
 	var share U0Message
 	rank := party.Rank
+	sourceBatch := make([][]fr.Element, dlinkzgOpeningCircuitClaims)
 	for claim := 0; claim < dlinkzgOpeningCircuitClaims; claim++ {
 		if len(sources[claim]) > prepared.t {
 			return state, share, fmt.Errorf("%w: source %d exceeds T", ErrCompiledMPIProtocol, claim)
 		}
-		state.local.shifted[claim] = cryptodlinkzg.FastTaylorShift(sources[claim], instance.Shift)
+		sourceBatch[claim] = sources[claim]
+	}
+	shiftedBatch := cryptodlinkzg.FastTaylorShiftBatch(sourceBatch, instance.Shift)
+	for claim := 0; claim < dlinkzgOpeningCircuitClaims; claim++ {
+		state.local.shifted[claim] = shiftedBatch[claim]
 		state.local.g[claim] = dlinkzgOpeningScalePolynomial(state.local.shifted[claim], prepared.weights[rank])
 		commitment, err := party.RowSRS.CommitZ(state.local.g[claim])
 		if err != nil {

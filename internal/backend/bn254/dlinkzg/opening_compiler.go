@@ -209,8 +209,13 @@ func proveDLinkZGOpeningWithTranscript(instance DLinkZGOpeningInstance, input DL
 	locals := make([]dlinkzgOpeningLocalState, prepared.m)
 	var u0Sums [dlinkzgOpeningCircuitClaims]bn254.G1Jac
 	for rank := 0; rank < prepared.m; rank++ {
+		sourceBatch := make([][]fr.Element, dlinkzgOpeningCircuitClaims)
 		for claim := 0; claim < dlinkzgOpeningCircuitClaims; claim++ {
-			locals[rank].shifted[claim] = cryptodlinkzg.FastTaylorShift(input.Sources[claim][rank], instance.Shift)
+			sourceBatch[claim] = input.Sources[claim][rank]
+		}
+		shiftedBatch := cryptodlinkzg.FastTaylorShiftBatch(sourceBatch, instance.Shift)
+		for claim := 0; claim < dlinkzgOpeningCircuitClaims; claim++ {
+			locals[rank].shifted[claim] = shiftedBatch[claim]
 			locals[rank].g[claim] = dlinkzgOpeningScalePolynomial(locals[rank].shifted[claim], prepared.weights[rank])
 			commitment, commitErr := input.PartySRS[rank].CommitZ(locals[rank].g[claim])
 			if commitErr != nil {

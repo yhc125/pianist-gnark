@@ -197,7 +197,7 @@ func ProveWithSolution(spr *cs.SparseR1CS, pk *ProvingKey, solution *Solution) (
 
 	// compute Z, the permutation accumulator polynomial, in canonical basis
 	// lL, lR, lO are NOT blinded
-	
+
 	zCanonicalX, selfProd, err := computeZCanonicalX(
 		lSmallX,
 		rSmallX,
@@ -219,7 +219,7 @@ func ProveWithSolution(spr *cs.SparseR1CS, pk *ProvingKey, solution *Solution) (
 	// this may add additional arithmetic operations, but with smaller tasks
 	// we ensure that this commitment is well parallelized, without having a
 	// "unbalanced task" making the rest of the code wait too long
-	if proof.Z, err = dkzg.Commit(zCanonicalX, pk.Vk.DKZGSRS, runtime.NumCPU()*2); err != nil {
+	if proof.Z, err = dkzg.Commit(zCanonicalX, pk.Vk.DKZGSRS, runtime.GOMAXPROCS(0)*2); err != nil {
 		return nil, err
 	}
 	if mpi.SelfRank == 0 {
@@ -272,9 +272,9 @@ func ProveWithSolution(spr *cs.SparseR1CS, pk *ProvingKey, solution *Solution) (
 	foldedHxDigest.ScalarMultiplication(&foldedHxDigest, &bAlphaPowerN)
 	foldedHxDigest.Add(&foldedHxDigest, &proof.Hx[2])
 	foldedHxDigest.ScalarMultiplication(&foldedHxDigest, &bAlphaPowerN)
-	foldedHxDigest.Add(&foldedHxDigest, &proof.Hx[1])                  
+	foldedHxDigest.Add(&foldedHxDigest, &proof.Hx[1])
 	foldedHxDigest.ScalarMultiplication(&foldedHxDigest, &bAlphaPowerN)
-	foldedHxDigest.Add(&foldedHxDigest, &proof.Hx[0])                  
+	foldedHxDigest.Add(&foldedHxDigest, &proof.Hx[0])
 
 	// foldedHx = Hx1 + (alpha**(N))*Hx2 + (alpha**(2(N)))*Hx3
 	foldedHx := hx4
@@ -454,7 +454,7 @@ func ProveWithSolution(spr *cs.SparseR1CS, pk *ProvingKey, solution *Solution) (
 		hFunc,
 		globalSRS,
 	)
-	
+
 	proof.WShiftedProof, err = kzg.Open(
 		wCanonicalY,
 		betaShifted,
@@ -484,7 +484,10 @@ func evalPolynomialsAtPoint(polys [][]fr.Element, point fr.Element) []fr.Element
 }
 
 func commitToLRO(bcl, bcr, bco []fr.Element, proof *Proof, srs *dkzg.SRS) error {
-	n := runtime.NumCPU() / 2
+	n := runtime.GOMAXPROCS(0) / 2
+	if n < 1 {
+		n = 1
+	}
 	var err error
 	proof.LRO[0], err = dkzg.Commit(bcl, srs, n)
 	if err != nil {
@@ -499,7 +502,10 @@ func commitToLRO(bcl, bcr, bco []fr.Element, proof *Proof, srs *dkzg.SRS) error 
 }
 
 func commitToQuotientX(h1, h2, h3, h4 []fr.Element, proof *Proof, srs *dkzg.SRS) error {
-	n := runtime.NumCPU() / 2
+	n := runtime.GOMAXPROCS(0) / 2
+	if n < 1 {
+		n = 1
+	}
 	var err error
 	proof.Hx[0], err = dkzg.Commit(h1, srs, n)
 	if err != nil {
@@ -518,7 +524,10 @@ func commitToQuotientX(h1, h2, h3, h4 []fr.Element, proof *Proof, srs *dkzg.SRS)
 }
 
 func commitToQuotientOnY(h1, h2, h3, h4 []fr.Element, proof *Proof, srs *kzg.SRS) error {
-	n := runtime.NumCPU() / 2
+	n := runtime.GOMAXPROCS(0) / 2
+	if n < 1 {
+		n = 1
+	}
 	var err error
 	proof.Hy[0], err = kzg.Commit(h1, srs, n)
 	if err != nil {
@@ -618,9 +627,9 @@ func evaluateLROSmallDomainX(spr *cs.SparseR1CS, pk *ProvingKey, solution []fr.E
 		offset = 0
 	}
 
-	start := int(mpi.SelfRank) * n + offset
+	start := int(mpi.SelfRank)*n + offset
 	end := start - offset + n
-	if end > len(spr.Constraints) + spr.NbPublicVariables {
+	if end > len(spr.Constraints)+spr.NbPublicVariables {
 		end = len(spr.Constraints) + spr.NbPublicVariables
 	}
 	for i := start; i < end; i++ { // constraints
@@ -645,17 +654,19 @@ func evaluateLROSmallDomainX(spr *cs.SparseR1CS, pk *ProvingKey, solution []fr.E
 
 // computeZ computes z, in canonical basis, where:
 //
-// * z of degree n (domainNum.Cardinality)
-// * z(1)=1
-// 							       (l(g**k)+eta*(g**k)+gamma)*(r(g**k)+eta*u*(g**k)+gamma)*(o(g**k)+eta*(u**2)*(g**k)+gamma)
-// * for i>0: z(g**i) = prod_{k<i} -------------------------------------------------------------------------------------------
-//							         (l(g**k)+eta*s1(g**k)+gamma)*(r(g**k)+eta*s2(g**k)+gamma)*(o(g**k)+eta*s3(g**k)+gamma)
+//   - z of degree n (domainNum.Cardinality)
 //
-//	* l, r, o are the solution in Lagrange basis, evaluated on the small domain
+//   - z(1)=1
+//     (l(g**k)+eta*(g**k)+gamma)*(r(g**k)+eta*u*(g**k)+gamma)*(o(g**k)+eta*(u**2)*(g**k)+gamma)
+//
+//   - for i>0: z(g**i) = prod_{k<i} -------------------------------------------------------------------------------------------
+//     (l(g**k)+eta*s1(g**k)+gamma)*(r(g**k)+eta*s2(g**k)+gamma)*(o(g**k)+eta*s3(g**k)+gamma)
+//
+//   - l, r, o are the solution in Lagrange basis, evaluated on the small domain
 func computeZCanonicalX(l, r, o []fr.Element, pk *ProvingKey, etaY, etaX, gamma fr.Element) ([]fr.Element, fr.Element, error) {
 	// note that z has more capacity has its memory is reused for z later on
-	z := make([]fr.Element, pk.Domain[0].Cardinality + 1)
-	gInv := make([]fr.Element, pk.Domain[0].Cardinality + 1)
+	z := make([]fr.Element, pk.Domain[0].Cardinality+1)
+	gInv := make([]fr.Element, pk.Domain[0].Cardinality+1)
 
 	z[0].SetOne()
 	gInv[0].SetOne()
@@ -692,7 +703,7 @@ func computeZCanonicalX(l, r, o []fr.Element, pk *ProvingKey, etaY, etaX, gamma 
 
 			f[0].Mul(&f[0], &f[1]).Mul(&f[0], &f[2])
 			g[0].Mul(&g[0], &g[1]).Mul(&g[0], &g[2])
-			
+
 			gInv[i+1] = g[0]
 			z[i+1] = f[0]
 		}
@@ -700,8 +711,8 @@ func computeZCanonicalX(l, r, o []fr.Element, pk *ProvingKey, etaY, etaX, gamma 
 
 	gInv = fr.BatchInvert(gInv)
 	for i := 0; i < n; i++ {
-		z[i + 1].Mul(&z[i + 1], &z[i]).
-			Mul(&z[i + 1], &gInv[i + 1])
+		z[i+1].Mul(&z[i+1], &z[i]).
+			Mul(&z[i+1], &gInv[i+1])
 	}
 
 	pk.Domain[0].FFTInverse(z[:n], fft.DIF)
@@ -712,7 +723,7 @@ func computeZCanonicalX(l, r, o []fr.Element, pk *ProvingKey, etaY, etaX, gamma 
 
 func computeWCanonicalY(selfProd fr.Element) ([]fr.Element, []fr.Element, *fr.Element, *fr.Element, error) {
 	if mpi.SelfRank == 0 {
-		W := make([]fr.Element, mpi.WorldSize + 1)
+		W := make([]fr.Element, mpi.WorldSize+1)
 		W[0].SetOne()
 		W[1] = selfProd
 		for i := uint64(1); i < mpi.WorldSize; i++ {
@@ -720,10 +731,10 @@ func computeWCanonicalY(selfProd fr.Element) ([]fr.Element, []fr.Element, *fr.El
 			if err != nil {
 				return nil, nil, nil, nil, err
 			}
-			W[i + 1].SetBytes(recvBuf)
+			W[i+1].SetBytes(recvBuf)
 		}
 		for i := uint64(1); i < mpi.WorldSize; i++ {
-			W[i + 1].Mul(&W[i + 1], &W[i])
+			W[i+1].Mul(&W[i+1], &W[i])
 		}
 		// DBG: Check whether the product is one.
 		if !W[mpi.WorldSize].IsOne() {
@@ -733,7 +744,7 @@ func computeWCanonicalY(selfProd fr.Element) ([]fr.Element, []fr.Element, *fr.El
 		for i := uint64(1); i < mpi.WorldSize; i++ {
 			// concatenate W[i].Bytes() and W[i+1].Bytes()
 			a := W[i].Bytes()
-			b:= W[i + 1].Bytes()
+			b := W[i+1].Bytes()
 			sendBuf := make([]byte, len(a)+len(b))
 			copy(sendBuf, a[:])
 			copy(sendBuf[len(a):], b[:])
@@ -742,16 +753,16 @@ func computeWCanonicalY(selfProd fr.Element) ([]fr.Element, []fr.Element, *fr.El
 			}
 		}
 		wCanonicalY := make([]fr.Element, mpi.WorldSize)
-		copy(wCanonicalY, W[:len(W) - 1])
+		copy(wCanonicalY, W[:len(W)-1])
 		globalDomain[0].FFTInverse(wCanonicalY, fft.DIF)
 		fft.BitReverse(wCanonicalY)
-		return W[:len(W) - 1], wCanonicalY, &W[0], &W[1], nil
+		return W[:len(W)-1], wCanonicalY, &W[0], &W[1], nil
 	} else {
 		sendBuf := selfProd.Bytes()
 		if err := mpi.SendBytes(sendBuf[:], 0); err != nil {
 			return nil, nil, nil, nil, err
 		}
-		recvBuf, err := mpi.ReceiveBytes(2 * fr.Bytes, 0)
+		recvBuf, err := mpi.ReceiveBytes(2*fr.Bytes, 0)
 		if err != nil {
 			return nil, nil, nil, nil, err
 		}
@@ -789,9 +800,10 @@ func evaluateXnMinusOneBig(domainBig, domainSmall *fft.Domain) []fr.Element {
 // hx1 + (X**N)hx2 + (X**(2N))h3 + (X**(3N))h4 such that
 //
 // ql(X)l(X)+qr(X)r(X)+qm(X)l(X)r(X)+qo(X)o(X)+qk(X)
-// + lambda * (
-// 		(1 - L_{n-1}(X))(z(mu*X)*g1(X)*g2(X)*g3(X)-z(X)*f1(X)*f2(X)*f3(X))
-//      L_{n-1}(X)*(cW*g1(X)*g2(X)*g3(X) - pW*z(X)*f1(X)*f2(X)*f3(X))
+//   - lambda * (
+//     (1 - L_{n-1}(X))(z(mu*X)*g1(X)*g2(X)*g3(X)-z(X)*f1(X)*f2(X)*f3(X))
+//     L_{n-1}(X)*(cW*g1(X)*g2(X)*g3(X) - pW*z(X)*f1(X)*f2(X)*f3(X))
+//
 // )
 // + (lambda**2) * L0(X)*(z(X)-1)
 // = hx(X)Zn(X)
@@ -862,15 +874,15 @@ func computeQuotientCanonicalX(pk *ProvingKey, lCanonicalX, rCanonicalX, oCanoni
 				Mul(&IDEtaX, &factorsBR[_j]).
 				Mul(&IDEtaX, &pk.Domain[1].FrMultiplicativeGen).
 				Mul(&IDEtaX, &etaX)
-			
+
 			for i := uint64(start); i < uint64(end); i++ {
 				_i := bits.Reverse64(uint64(i)) >> nn
-				_is := bits.Reverse64(uint64((i + 1)) & (n - 1)) >> nn
+				_is := bits.Reverse64(uint64((i+1))&(n-1)) >> nn
 
 				// Compute permutation constraints L0(X)*(z(X)-1)
-				h[hStart + _i].Sub(&z[_i], &one).Mul(&h[hStart + _i], &l0[_i])
-				
-				// Compute permutation constraints 
+				h[hStart+_i].Sub(&z[_i], &one).Mul(&h[hStart+_i], &l0[_i])
+
+				// Compute permutation constraints
 				// (1 - L_{n - 1}(X))z(mu*X)*g1(X)*g2(X)*g3(X) - z(X)*f1(X)*f2(X)*f3(X)
 				// + L_{n-1}(X)*(cW*g1(X)*g2(X)*g3(X) - pW*z(X)*f1(X)*f2(X)*f3(X))
 				f[0].Add(&IDEtaX, &IDEtaY).Add(&f[0], &l[_i]).Add(&f[0], &gamma)
@@ -885,30 +897,30 @@ func computeQuotientCanonicalX(pk *ProvingKey, lCanonicalX, rCanonicalX, oCanoni
 				g[1].Mul(&sx2[_i], &etaX).Add(&g[1], &t[1]).Add(&g[1], &r[_i]).Add(&g[1], &gamma)
 				g[2].Mul(&sx3[_i], &etaX).Add(&g[2], &t[2]).Add(&g[2], &o[_i]).Add(&g[2], &gamma)
 				g[0].Mul(&g[0], &g[1]).Mul(&g[0], &g[2])
-				
+
 				oneMinusLL.Sub(&one, &ll[_i])
 				t0.Mul(&f[0], &z[_i])
 				t1.Mul(&g[0], &z[_is])
 				t1.Sub(&t1, &t0).Mul(&t1, &oneMinusLL)
-				h[hStart + _i].Mul(&h[hStart + _i], &lambda).Add(&h[hStart + _i], &t1)
+				h[hStart+_i].Mul(&h[hStart+_i], &lambda).Add(&h[hStart+_i], &t1)
 
 				t0.Mul(&t0, &pW)
 				t1.Mul(&g[0], &cW)
 				t1.Sub(&t1, &t0).Mul(&t1, &ll[_i])
-				h[hStart + _i].Add(&h[hStart + _i], &t1)
+				h[hStart+_i].Add(&h[hStart+_i], &t1)
 				IDEtaX.Mul(&IDEtaX, &pk.Domain[0].Generator)
 
 				// Compute gate constraint
 				t1.Mul(&qm[_i], &r[_i])
 				t1.Add(&t1, &ql[_i])
 				t1.Mul(&t1, &l[_i])
-	
+
 				t0.Mul(&qr[_i], &r[_i])
 				t0.Add(&t0, &t1)
-	
+
 				t1.Mul(&qo[_i], &o[_i])
 				t0.Add(&t0, &t1).Add(&t0, &qk[_i])
-				h[hStart + _i].Mul(&h[hStart + _i], &lambda).Add(&h[hStart + _i], &t0)
+				h[hStart+_i].Mul(&h[hStart+_i], &lambda).Add(&h[hStart+_i], &t0)
 			}
 		})
 	}
@@ -919,15 +931,15 @@ func computeQuotientCanonicalX(pk *ProvingKey, lCanonicalX, rCanonicalX, oCanoni
 	utils.Parallelize(int(pk.Domain[1].Cardinality), func(start, end int) {
 		for _i := uint64(start); _i < uint64(end); _i++ {
 			i := bits.Reverse64(_i) >> nn2
-			h[_i].Mul(&h[_i], &XnMinusOneInv[i % ratio])
+			h[_i].Mul(&h[_i], &XnMinusOneInv[i%ratio])
 		}
 	})
 	pk.Domain[1].FFTInverse(h, fft.DIT, true)
 
 	h1 := h[:n]
-	h2 := h[n: 2*n]
-	h3 := h[2*n: 3*n]
-	h4 := h[3*n: 4*n]
+	h2 := h[n : 2*n]
+	h3 := h[2*n : 3*n]
+	h4 := h[3*n : 4*n]
 
 	for i := int(4 * n); i < len(h); i++ {
 		fmt.Println(h[i].String())
@@ -943,9 +955,10 @@ func computeQuotientCanonicalX(pk *ProvingKey, lCanonicalX, rCanonicalX, oCanoni
 // Hy1 + (Y**M)Hy2 + (Y**(2M))Hy3 + (Y**(3M))Hy4 such that
 //
 // Ql(Y, alpha)L(Y, alpha)+Qr(Y, alpha)R(Y, alpha)+Qm(Y, alpha)L(Y, alpha)R(Y, alpha)+Qo(Y, alpha)O(Y, alpha)+Qk(Y, alpha)
-// + lambda * (
-// 		(1 - Lx_{n-1}(X)) (Z(Y, omegaX*alpha)*G1(Y, alpha)*G2(Y, alpha)*G3(Y, alpha) - Z(Y, alpha)*F1(Y, alpha)*F2(Y, alpha)*F3(Y, alpha))
-// 		+ Lx_{n-1}(X) (W(omegaY*Y)*G1(Y, alpha)*G2(Y, alpha)*G3(Y, alpha) - W(Y)*Z(Y, alpha)*F1(Y, alpha)*F2(Y, alpha)*F3(Y, alpha))
+//   - lambda * (
+//     (1 - Lx_{n-1}(X)) (Z(Y, omegaX*alpha)*G1(Y, alpha)*G2(Y, alpha)*G3(Y, alpha) - Z(Y, alpha)*F1(Y, alpha)*F2(Y, alpha)*F3(Y, alpha))
+//   - Lx_{n-1}(X) (W(omegaY*Y)*G1(Y, alpha)*G2(Y, alpha)*G3(Y, alpha) - W(Y)*Z(Y, alpha)*F1(Y, alpha)*F2(Y, alpha)*F3(Y, alpha))
+//
 // )
 // + lambda**2 * Lx0(alpha)*(Z(Y, alpha) - 1)
 // + lambda**3 * Ly0(Y)(W(Y) - 1)
@@ -1025,13 +1038,13 @@ func computeQuotientCanonicalY(pk *ProvingKey, polys [][]fr.Element, etaY, etaX,
 				Mul(&IDEtaY, &globalDomain[1].FrMultiplicativeGen).Mul(&IDEtaY, &etaY)
 			for i := uint64(start); i < uint64(end); i++ {
 				_i := bits.Reverse64(uint64(i)) >> nn
-				_is := bits.Reverse64(uint64((i + 1)) & (n - 1)) >> nn
+				_is := bits.Reverse64(uint64((i+1))&(n-1)) >> nn
 				// Compute the permutation constraint Ly0(Y)(W(Y) - 1)
-				h[hStart + _i].Sub(&w[_i], &one).Mul(&h[hStart + _i], &ly0[_i])
+				h[hStart+_i].Sub(&w[_i], &one).Mul(&h[hStart+_i], &ly0[_i])
 
 				// Compute the permutation constraint Lx0(alpha)(Z(Y, alpha) - 1)
 				t0.Sub(&z[_i], &one).Mul(&t0, &lx0)
-				h[hStart + _i].Mul(&h[hStart + _i], &lambda).Add(&h[hStart + _i], &t0)
+				h[hStart+_i].Mul(&h[hStart+_i], &lambda).Add(&h[hStart+_i], &t0)
 
 				// Compute the permutation constraint
 				// (1 - Lx_{n - 1}(X))(Z(Y, omegaX*alpha)()()() - Z(Y, alpha)()()())
@@ -1052,30 +1065,30 @@ func computeQuotientCanonicalY(pk *ProvingKey, polys [][]fr.Element, etaY, etaX,
 				t0.Mul(&f[0], &z[_i])
 				t1.Mul(&g[0], &zs[_i])
 				t1.Sub(&t1, &t0).Mul(&t1, &oneMinusLxL)
-				h[hStart + _i].Mul(&h[hStart + _i], &lambda).Add(&h[hStart + _i], &t1)
+				h[hStart+_i].Mul(&h[hStart+_i], &lambda).Add(&h[hStart+_i], &t1)
 
 				t0.Mul(&t0, &w[_i])
 				t1.Mul(&g[0], &w[_is])
 				t1.Sub(&t1, &t0).Mul(&t1, &lxl)
-				h[hStart + _i].Add(&h[hStart + _i], &t1)
+				h[hStart+_i].Add(&h[hStart+_i], &t1)
 				IDEtaY.Mul(&IDEtaY, &globalDomain[0].Generator)
 
 				// Compute the gate constraint.
 				t1.Mul(&qm[_i], &r[_i])
 				t1.Add(&t1, &ql[_i])
 				t1.Mul(&t1, &l[_i])
-	
+
 				t0.Mul(&qr[_i], &r[_i])
 				t0.Add(&t0, &t1)
-	
+
 				t1.Mul(&qo[_i], &o[_i])
 				t0.Add(&t0, &t1)
 				t0.Add(&t0, &qk[_i])
-				h[hStart + _i].Mul(&h[hStart + _i], &lambda).Add(&h[hStart + _i], &t0)
+				h[hStart+_i].Mul(&h[hStart+_i], &lambda).Add(&h[hStart+_i], &t0)
 
 				// Remove Hx(Y, alpha) * (alpha^N - 1)
 				t0.Mul(&foldedHx[_i], &vanishingX)
-				h[hStart + _i].Sub(&h[hStart + _i], &t0)
+				h[hStart+_i].Sub(&h[hStart+_i], &t0)
 			}
 		})
 	}
@@ -1086,7 +1099,7 @@ func computeQuotientCanonicalY(pk *ProvingKey, polys [][]fr.Element, etaY, etaX,
 	utils.Parallelize(int(globalDomain[1].Cardinality), func(start, end int) {
 		for _i := uint64(start); _i < uint64(end); _i++ {
 			i := bits.Reverse64(_i) >> nn2
-			h[_i].Mul(&h[_i], &evaluationYmMinusOneInverse[i % ratio])
+			h[_i].Mul(&h[_i], &evaluationYmMinusOneInverse[i%ratio])
 		}
 	})
 
@@ -1133,7 +1146,7 @@ func checkConstraintX(pk *ProvingKey, evalsXOnAlpha [][]fr.Element, zShiftedAlph
 		z := evalsXOnAlpha[15][k]
 		zs := zShiftedAlpha[k]
 		pw := wSmallY[k]
-		cw := wSmallY[(k + 1)%int(mpi.WorldSize)]
+		cw := wSmallY[(k+1)%int(mpi.WorldSize)]
 		var IDEtaY fr.Element
 		IDEtaY.Exp(globalDomain[0].Generator, big.NewInt(int64(k))).Mul(&IDEtaY, &etaY)
 
@@ -1173,7 +1186,7 @@ func checkConstraintX(pk *ProvingKey, evalsXOnAlpha [][]fr.Element, zShiftedAlph
 		prodfz.Mul(&prodfz, &pw)
 		case2.Mul(&prodg, &cw).Sub(&case2, &prodfz).Mul(&case2, &ll)
 		secondPart.Add(&case1, &case2)
-		
+
 		// third part Lx0(alpha)*(Z(Y, alpha) - 1)
 		var thirdPart fr.Element
 		thirdPart.Sub(&z, &one).Mul(&thirdPart, &l0)
