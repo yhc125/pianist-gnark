@@ -152,7 +152,17 @@ func TestOuterTranscriptTamperPropagation(t *testing.T) {
 	_, base := runTestOuterTranscript(t, context, messages)
 
 	contextTamper := context
-	contextTamper.ShiftCounter++
+	contextTamper.IndexPrefixDigest = NewTranscriptDigest([]byte("outer-index-prefix-B"))
+	shift, err := DeriveIndexShift(
+		contextTamper.IndexPrefixDigest,
+		contextTamper.LocalDomainSize,
+		contextTamper.LocalDomainGenerator,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	contextTamper.ShiftCounter = shift.Counter
+	contextTamper.Shift = shift.Sigma
 	_, changedContext := runTestOuterTranscript(t, contextTamper, messages)
 	assertOuterChallengeChanged(t, base.Initial.EtaPart, changedContext.Initial.EtaPart, "context -> eta_part")
 
@@ -426,8 +436,9 @@ func TestOuterTranscriptContextValidationBoundary(t *testing.T) {
 
 	context = testOuterTranscriptContext()
 	context.ShiftCounter++
-	if _, err := NewOuterTranscript(context); err != nil {
-		t.Fatalf("counter minimality must remain a setup-suite obligation: %v", err)
+	if _, err := NewOuterTranscript(context); !errors.Is(err, ErrInvalidOuterTranscriptContext) ||
+		!errors.Is(err, ErrIndexShiftNonMinimal) {
+		t.Fatalf("nonminimal shift counter: got %v", err)
 	}
 }
 
@@ -450,21 +461,21 @@ func TestOuterTranscriptLargeDomainKeepsConstantSizeState(t *testing.T) {
 func TestOuterTranscriptGoldenVector(t *testing.T) {
 	transcript, output := runTestOuterTranscript(t, testOuterTranscriptContext(), testOuterTranscriptMessages())
 	challenges := output.ordered()
-	expectedCounters := []uint32{6, 2, 0, 3, 5, 13, 3, 8, 5, 6, 0, 8, 5}
+	expectedCounters := []uint32{0, 1, 3, 12, 5, 1, 3, 8, 0, 3, 4, 9, 5}
 	expectedValues := []string{
-		"0500fd2fbca64735cbb833fd40ead74025e2a411614375a64f229705a8b2ef9a",
-		"24d94f19f548616dc069de19fb90169f3bf190df5d4663f0d94c5eebf46b5bd5",
-		"21dd5cdb8d73c960da74e89047ee9328e0f1812bb8610728c9178c967912e0d5",
-		"2cc805d468dca699795ef652bb3611394329fa738576a940c22946c4d4072788",
-		"1ac93ff6d9a9c9c07461036a75bb01dbf3c97c8aa53c7472ab0b3c99b775323b",
-		"02b50d91ca2e604d7d10e28954bf5dcddc70ace722d7474666877b73b4867c16",
-		"2a6b6327913336afccb368809db7d5b9ba91c760a3bc8f5c2ad9038eb3e16c00",
-		"0d5b1671643b456371de1e0528b346f64961c2af94f0d094ef98bfabaa96b9b6",
-		"15308ae55422ab81e0acbc4ff4e71cf7c304e659beeaee006d29222c9a2b64c9",
-		"0869e3e27448388f9a2d3dfa2912bfb22dc1f0a90030b34173a9053c3d108d8b",
-		"2edb3dce437b34b0dfa320def2310c1789df1fa672dde6be6a3ae370e3e9296b",
-		"1412b2bd55a3b92ca30b4a4574f3578aac5adb5d440ac3994a5a9f6a26ff62eb",
-		"1aae01c8144b1cacc9da2fa9bb05b0df70ff3b748a38a80ee981be30fc9581c1",
+		"1e180c279df01f6f36d2ce6094c710914d564bde858656746174e05274dfc322",
+		"2ff6242afa29663c93215a30772c3ead0d1b95b1538a8d3fdf809d8594918f88",
+		"1bd4576e00295ea471b4cb12e5d5d42ab33f4932fc889399813f57b8370e669b",
+		"03f4f36f2309b0cc0d46c83c92121fc57fe3065449fd8c4e3fae37a22fbe32e3",
+		"2fc59e40a679b5eff5cb9293f8a9bdd7eb7da1f01d6be07982ea932ae63b603a",
+		"0d6409d3d0c39547fc5cc3b485ceeb72fd7719d21fdc8bf2e9ba811be3b9c7d2",
+		"248c2926d2df1e108f98eb0abd703ada1f5914b7b8fd695af7e833fd59737c25",
+		"27e85a61a8fcf1f9d135338153baff0a78c7e16ac67cb9741301ecc2e6c3bba7",
+		"190586b316b0c317cc1cf0a9e9ed568094f17d1d3e78b8b6a1afd095ce56613e",
+		"16197f52a4e20087a87ee89811e6fc75155ec59946bc06915ed088bdf9492157",
+		"19bd4592bcef619b2c61573baa581f126064b46f7e3fe3c48f535709972badc1",
+		"284dcf6170560e8a4e7012e6d838e377ffcbbfe56adc31d53f3ca1136a826787",
+		"0c788664a7dca054ff4d0bcc3b4b31de0248bf03d6201f1eb7303eebe3e8e073",
 	}
 	for i := range challenges {
 		encoded := challenges[i].Value.Bytes()
@@ -473,7 +484,7 @@ func TestOuterTranscriptGoldenVector(t *testing.T) {
 		}
 	}
 	digest := transcript.Digest()
-	const expectedDigest = "032387dce28818ae8dc7ad79e183b965f4f7b5704fa47aa9e784ee396c5736cb"
+	const expectedDigest = "fbef8b1e4a8041b09bc8005153b398bc6ee6855a3a923dcc355f98b1e203907b"
 	if hex.EncodeToString(digest[:]) != expectedDigest {
 		t.Fatalf("golden outer transcript digest mismatch: %s", hex.EncodeToString(digest[:]))
 	}
@@ -624,14 +635,19 @@ func deriveOuterThroughFinalEvaluations(t *testing.T, context OuterTranscriptCon
 
 func testOuterTranscriptContext() OuterTranscriptContext {
 	domain := fft.NewDomain(4)
+	indexPrefixDigest := NewTranscriptDigest([]byte("outer-index-prefix-A"))
+	shift, err := DeriveIndexShift(indexPrefixDigest, 4, domain.Generator)
+	if err != nil {
+		panic(err)
+	}
 	return OuterTranscriptContext{
 		ProtocolVersion:       "dlinkzg-outer-test-v1",
 		PublicStatementDigest: NewTranscriptDigest([]byte("outer-statement-A")),
 		SRSDigest:             NewTranscriptDigest([]byte("outer-srs-A")),
 		IndexDigest:           NewTranscriptDigest([]byte("outer-index-A")),
-		IndexPrefixDigest:     NewTranscriptDigest([]byte("outer-index-prefix-A")),
-		ShiftCounter:          7,
-		Shift:                 fr.NewElement(42),
+		IndexPrefixDigest:     indexPrefixDigest,
+		ShiftCounter:          shift.Counter,
+		Shift:                 shift.Sigma,
 		PartyManifestDigest:   NewTranscriptDigest([]byte("outer-P1,P2,P3,P4")),
 		SessionNonce:          [32]byte(NewTranscriptDigest([]byte("outer-session-0001"))),
 		PartitionCount:        4,

@@ -29,9 +29,10 @@ const (
 	outerChallengeHashDomain = "DLinKZG/outer-piop-hash-to-field/sha256/v1"
 
 	// OuterTranscriptBoundaryNotice records what this component deliberately
-	// does not invent. In particular, the paper leaves setup HashToField as a
-	// suite abstraction and keeps W3 records outside the accepted public proof.
-	OuterTranscriptBoundaryNotice = "accepted public outer PIOP transcript through mu: W3 is an accountability-only retained transition; setup-suite validation of HashToField(pref_index, DLinKZG/sigma, c_sigma)=sigma and counter minimality is external"
+	// does not invent. W3 records remain outside the accepted public proof,
+	// while the concrete benchmark suite validates its setup index shift before
+	// accepting the transcript context.
+	OuterTranscriptBoundaryNotice = "accepted public outer PIOP transcript through mu: W3 is an accountability-only retained transition; the BN254/SHA-256 benchmark suite validates the canonical setup index shift"
 
 	OuterTerminalEvaluationCount = LocalTerminalTotalCount
 	OuterProductCheckClaimCount  = 5
@@ -59,9 +60,8 @@ var (
 
 // OuterTranscriptContext is the immutable public context for the outer PIOP
 // prefix. IndexPrefixDigest canonically represents pref_index. ShiftCounter
-// and Shift are bound as public data, while validation that they are the
-// minimal output of the setup suite's abstract HashToField is a caller
-// obligation. This component does validate x_star-sigma notin B_T.
+// and Shift are bound as public data and must be the first admissible output
+// of the concrete benchmark suite's HashToField instantiation.
 type OuterTranscriptContext struct {
 	ProtocolVersion       string
 	PublicStatementDigest TranscriptDigest
@@ -507,12 +507,14 @@ func validateOuterTranscriptContext(context OuterTranscriptContext) error {
 		return fmt.Errorf("%w: generator does not have exact order T", ErrInvalidOuterTranscriptContext)
 	}
 
-	var xStar fr.Element
-	xStar.Inverse(&context.LocalDomainGenerator)
-	translatedXStar := xStar
-	translatedXStar.Sub(&translatedXStar, &context.Shift)
-	if outerInBoundarySet(translatedXStar, context.LocalDomainSize) {
-		return fmt.Errorf("%w: x_star-sigma lies in B_T", ErrInvalidOuterTranscriptContext)
+	if err := VerifyIndexShift(
+		context.IndexPrefixDigest,
+		context.LocalDomainSize,
+		context.LocalDomainGenerator,
+		context.ShiftCounter,
+		context.Shift,
+	); err != nil {
+		return fmt.Errorf("%w: invalid canonical index shift: %w", ErrInvalidOuterTranscriptContext, err)
 	}
 	return nil
 }
