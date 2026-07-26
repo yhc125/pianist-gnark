@@ -19,7 +19,7 @@ import (
 func validTestConfig(backend string, workers uint64) config {
 	return config{
 		backend: backend, curve: "bn254", circuit: "synthetic-mul",
-		constraints: 4096, workers: workers, seed: 7,
+		constraints: 4096, workers: workers, seed: 7, threads: 1,
 	}
 }
 

@@ -37,6 +37,7 @@ type config struct {
 	constraints int
 	workers     uint64
 	seed        uint64
+	threads     int
 	jsonOutput  bool
 }
 
@@ -288,6 +289,41 @@ func dlinkzgArtifactMetrics(partitions uint64, encodedBytes int) (map[string]flo
 	}, nil
 }
 
+func dlinkzgCoordinatorProfileTimings(profile dlinkzgbackend.CompiledMPIProfile) map[string]float64 {
+	result := make(map[string]float64)
+	var total, transport, active time.Duration
+	phases := []struct {
+		phase dlinkzgbackend.ProtocolMPIPhase
+		name  string
+	}{
+		{dlinkzgbackend.ProtocolMPIPhaseW0, "w0"},
+		{dlinkzgbackend.ProtocolMPIPhaseW1, "w1"},
+		{dlinkzgbackend.ProtocolMPIPhaseW2, "w2"},
+		{dlinkzgbackend.ProtocolMPIPhaseW3, "w3"},
+		{dlinkzgbackend.ProtocolMPIPhaseU0, "u0"},
+		{dlinkzgbackend.ProtocolMPIPhaseU1, "u1"},
+		{dlinkzgbackend.ProtocolMPIPhaseU2, "u2"},
+		{dlinkzgbackend.ProtocolMPIPhaseU3, "u3"},
+	}
+	for _, entry := range phases {
+		timing, ok := profile.Phase(entry.phase)
+		if !ok {
+			continue
+		}
+		phaseActive := timing.Active()
+		result["coordinator_"+entry.name+"_total"] = milliseconds(timing.Total)
+		result["coordinator_"+entry.name+"_transport"] = milliseconds(timing.Transport)
+		result["coordinator_"+entry.name+"_active"] = milliseconds(phaseActive)
+		total += timing.Total
+		transport += timing.Transport
+		active += phaseActive
+	}
+	result["coordinator_protocol_profile_total"] = milliseconds(total)
+	result["coordinator_protocol_transport"] = milliseconds(transport)
+	result["coordinator_protocol_active"] = milliseconds(active)
+	return result
+}
+
 // synchronizeWorld is benchmark scaffolding, not part of either proof. It
 // makes the root wall clock include the slowest rank at every measured phase.
 // Its one-byte messages are deliberately excluded from the communication
@@ -398,6 +434,7 @@ func parseConfig() config {
 	flag.IntVar(&cfg.constraints, "constraints", 4096, "target number of constraints")
 	flag.Uint64Var(&cfg.workers, "workers", 1, "expected worker process count")
 	flag.Uint64Var(&cfg.seed, "seed", 1, "deterministic witness seed")
+	flag.IntVar(&cfg.threads, "threads", runtime.NumCPU(), "maximum Go threads per MPI process")
 	flag.BoolVar(&cfg.jsonOutput, "json", false, "emit the adapter JSON contract")
 	flag.Parse()
 	return cfg
@@ -415,6 +452,9 @@ func validateConfig(cfg config) error {
 	}
 	if cfg.workers == 0 {
 		return errors.New("workers must be positive")
+	}
+	if cfg.threads <= 0 {
+		return errors.New("threads must be positive")
 	}
 	if cfg.backend == "gpiano" && cfg.workers != mpi.WorldSize {
 		return fmt.Errorf("--workers=%d does not match MPI world size %d", cfg.workers, mpi.WorldSize)
@@ -629,6 +669,7 @@ func runGPiano(cfg config) (adapterResult, error) {
 			"local_domain_size":     float64(localDomainSize),
 			"global_padded_rows":    float64(localDomainSize * mpi.WorldSize),
 			"quotient_domain_size":  float64(concretePK.Domain[1].Cardinality),
+			"gomaxprocs":            float64(runtime.GOMAXPROCS(0)),
 		},
 		Verification: verification{Accepted: true},
 	}
@@ -727,6 +768,17 @@ func runDLinKZG(cfg config) (adapterResult, error) {
 		return adapterResult{}, fmt.Errorf("build dlinkzg prover config: %w", err)
 	}
 
+	proverPrepareStarted := time.Now()
+	channel, err := dlinkzgbackend.NewProtocolMPIChannel()
+	if err != nil {
+		return adapterResult{}, fmt.Errorf("build dlinkzg protocol channel: %w", err)
+	}
+	prover, err := dlinkzgbackend.NewCompiledMPIProver(channel, vk, role)
+	if err != nil {
+		return adapterResult{}, fmt.Errorf("validate dlinkzg online role: %w", err)
+	}
+	proverPrepareElapsed := time.Since(proverPrepareStarted)
+
 	solveStarted := time.Now()
 	var partySolution []fr.Element
 	if mpi.SelfRank != 0 {
@@ -740,14 +792,8 @@ func runDLinKZG(cfg config) (adapterResult, error) {
 	}
 	solveElapsed := time.Since(solveStarted)
 
-	channel, err := dlinkzgbackend.NewProtocolMPIChannel()
-	if err != nil {
-		return adapterResult{}, fmt.Errorf("build dlinkzg protocol channel: %w", err)
-	}
 	proveStarted := time.Now()
-	proof, err := dlinkzgbackend.CompiledProveMPI(
-		channel, vk, statement, role, partySolution,
-	)
+	proof, proveProfile, err := prover.ProveProfiled(statement, partySolution)
 	if err != nil {
 		return adapterResult{}, fmt.Errorf("dlinkzg prove: %w", err)
 	}
@@ -807,17 +853,22 @@ func runDLinKZG(cfg config) (adapterResult, error) {
 	for value := cfg.workers; value > 1; value >>= 1 {
 		logPartitions++
 	}
+	timings := map[string]float64{
+		"compile":             milliseconds(compileElapsed),
+		"setup":               milliseconds(setupElapsed),
+		"setup_including_srs": milliseconds(setupElapsed),
+		"prover_prepare":      milliseconds(proverPrepareElapsed),
+		"witness_solve":       milliseconds(solveElapsed),
+		"prove":               milliseconds(proveCryptoElapsed),
+		"prove_crypto_wall":   milliseconds(proveCryptoElapsed),
+		"prove_end_to_end":    milliseconds(proveEndToEndElapsed),
+		"verify":              milliseconds(verifyElapsed),
+	}
+	for name, value := range dlinkzgCoordinatorProfileTimings(proveProfile) {
+		timings[name] = value
+	}
 	return adapterResult{
-		Timings: map[string]float64{
-			"compile":             milliseconds(compileElapsed),
-			"setup":               milliseconds(setupElapsed),
-			"setup_including_srs": milliseconds(setupElapsed),
-			"witness_solve":       milliseconds(solveElapsed),
-			"prove":               milliseconds(proveCryptoElapsed),
-			"prove_crypto_wall":   milliseconds(proveCryptoElapsed),
-			"prove_end_to_end":    milliseconds(proveEndToEndElapsed),
-			"verify":              milliseconds(verifyElapsed),
-		},
+		Timings:       timings,
 		Communication: communication,
 		Artifacts:     artifacts,
 		Resources: map[string]float64{
@@ -840,6 +891,7 @@ func runDLinKZG(cfg config) (adapterResult, error) {
 			"quotient_domain_size":       float64(4 * localDomainSize),
 			"sumcheck_rounds":            float64(logPartitions),
 			"protocol_operations":        float64(accounting.Operations),
+			"gomaxprocs":                 float64(runtime.GOMAXPROCS(0)),
 			"deterministic_setup":        1,
 			"setup_full_bundle_per_rank": 1,
 			"publication_ready_setup":    0,
@@ -904,6 +956,7 @@ func runPLONK(cfg config) (adapterResult, error) {
 			"partitions":            1,
 			"local_domain_size":     float64(measured.DomainSize),
 			"global_padded_rows":    float64(measured.DomainSize),
+			"gomaxprocs":            float64(runtime.GOMAXPROCS(0)),
 		},
 		Verification: verification{Accepted: measured.Accepted},
 	}, nil
@@ -927,6 +980,7 @@ func run(cfg config) (adapterResult, error) {
 
 func main() {
 	cfg := parseConfig()
+	runtime.GOMAXPROCS(cfg.threads)
 	if err := initializeMPIWorld(cfg); err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)

@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"math/bits"
+	"time"
 
 	"github.com/consensys/gnark-crypto/ecc/bn254"
 	"github.com/consensys/gnark-crypto/ecc/bn254/fr"
@@ -29,6 +30,80 @@ var (
 type CompiledMPIRole struct {
 	Party       *CompiledPartySetup
 	Coordinator *CompiledCoordinatorSetup
+}
+
+// CompiledMPIProver is a setup-validated, rank-local online prover. The
+// expensive circuit, SRS, fixed-table, and role checks are performed once by
+// NewCompiledMPIProver. Prove still validates every statement and its binding
+// to the rank-local solution before executing the transcript.
+//
+// The role and verifying key used to construct a CompiledMPIProver must be
+// treated as immutable for the lifetime of the prover.
+type CompiledMPIProver struct {
+	channel *ProtocolMPIChannel
+	vk      CompiledVerifyingKey
+	role    CompiledMPIRole
+}
+
+// CompiledMPIPhaseTiming separates elapsed phase time from time spent inside
+// transport collectives. On the coordinator, Active is therefore an
+// approximation of root-side computation/serialization and Transport
+// includes network service plus waiting for workers.
+type CompiledMPIPhaseTiming struct {
+	Total     time.Duration
+	Transport time.Duration
+}
+
+// Active returns phase time outside transport calls.
+func (timing CompiledMPIPhaseTiming) Active() time.Duration {
+	if timing.Transport >= timing.Total {
+		return 0
+	}
+	return timing.Total - timing.Transport
+}
+
+// CompiledMPIProfile is diagnostic state and is never serialized into a
+// proof. Entries are indexed by ProtocolMPIPhase W0--U3.
+type CompiledMPIProfile struct {
+	phases [8]CompiledMPIPhaseTiming
+}
+
+// Phase returns one W0--U3 timing entry.
+func (profile CompiledMPIProfile) Phase(phase ProtocolMPIPhase) (CompiledMPIPhaseTiming, bool) {
+	index := int(phase)
+	if index < 0 || index >= len(profile.phases) {
+		return CompiledMPIPhaseTiming{}, false
+	}
+	return profile.phases[index], true
+}
+
+func (profile *CompiledMPIProfile) recordTotal(phase ProtocolMPIPhase, elapsed time.Duration) {
+	if profile != nil {
+		profile.phases[int(phase)].Total += elapsed
+	}
+}
+
+func (profile *CompiledMPIProfile) recordTransport(phase ProtocolMPIPhase, elapsed time.Duration) {
+	if profile != nil {
+		profile.phases[int(phase)].Transport += elapsed
+	}
+}
+
+func startCompiledMPITransportProfile(profile *CompiledMPIProfile) time.Time {
+	if profile == nil {
+		return time.Time{}
+	}
+	return time.Now()
+}
+
+func finishCompiledMPITransportProfile(
+	profile *CompiledMPIProfile,
+	phase ProtocolMPIPhase,
+	started time.Time,
+) {
+	if profile != nil {
+		profile.recordTransport(phase, time.Since(started))
+	}
 }
 
 // compiledMPITrace is test/diagnostic state, never a proof field. It lets the
@@ -94,8 +169,66 @@ func CompiledProveMPI(
 	role CompiledMPIRole,
 	partySolution []fr.Element,
 ) (*CompiledProof, error) {
-	proof, _, err := compiledProveMPIWithTrace(channel, vk, statement, role, partySolution)
+	prover, err := NewCompiledMPIProver(channel, vk, role)
+	if err != nil {
+		return nil, err
+	}
+	return prover.Prove(statement, partySolution)
+}
+
+// NewCompiledMPIProver validates the static online role boundary once. It is
+// intended to run immediately after setup/key loading and outside repeated
+// online proving measurements.
+func NewCompiledMPIProver(
+	channel *ProtocolMPIChannel,
+	vk CompiledVerifyingKey,
+	role CompiledMPIRole,
+) (*CompiledMPIProver, error) {
+	if err := validateCompiledMPIStaticRole(channel, vk, role); err != nil {
+		return nil, err
+	}
+	return &CompiledMPIProver{channel: channel, vk: vk, role: role}, nil
+}
+
+// Prove validates the proof-specific statement and solution binding, then
+// executes the fixed 17-operation protocol without repeating setup checks.
+func (prover *CompiledMPIProver) Prove(
+	statement CompiledStatement,
+	partySolution []fr.Element,
+) (*CompiledProof, error) {
+	if prover == nil {
+		return nil, fmt.Errorf("%w: nil validated prover", ErrInvalidCompiledMPIRole)
+	}
+	if err := validateCompiledMPIDynamicInput(
+		prover.vk, statement, prover.role, partySolution,
+	); err != nil {
+		return nil, err
+	}
+	proof, _, err := compiledProveMPIWithTraceValidatedProfiled(
+		prover.channel, prover.vk, statement, prover.role, partySolution, nil,
+	)
 	return proof, err
+}
+
+// ProveProfiled is Prove with diagnostic phase timing. It exists for the
+// benchmark adapter; protocol callers should normally use Prove.
+func (prover *CompiledMPIProver) ProveProfiled(
+	statement CompiledStatement,
+	partySolution []fr.Element,
+) (*CompiledProof, CompiledMPIProfile, error) {
+	var profile CompiledMPIProfile
+	if prover == nil {
+		return nil, profile, fmt.Errorf("%w: nil validated prover", ErrInvalidCompiledMPIRole)
+	}
+	if err := validateCompiledMPIDynamicInput(
+		prover.vk, statement, prover.role, partySolution,
+	); err != nil {
+		return nil, profile, err
+	}
+	proof, _, err := compiledProveMPIWithTraceValidatedProfiled(
+		prover.channel, prover.vk, statement, prover.role, partySolution, &profile,
+	)
+	return proof, profile, err
 }
 
 func compiledProveMPIWithTrace(
@@ -106,9 +239,24 @@ func compiledProveMPIWithTrace(
 	partySolution []fr.Element,
 ) (*CompiledProof, compiledMPITrace, error) {
 	var trace compiledMPITrace
-	if err := validateCompiledMPIRole(channel, vk, statement, role, partySolution); err != nil {
+	if err := validateCompiledMPIStaticRole(channel, vk, role); err != nil {
 		return nil, trace, err
 	}
+	if err := validateCompiledMPIDynamicInput(vk, statement, role, partySolution); err != nil {
+		return nil, trace, err
+	}
+	return compiledProveMPIWithTraceValidatedProfiled(channel, vk, statement, role, partySolution, nil)
+}
+
+func compiledProveMPIWithTraceValidatedProfiled(
+	channel *ProtocolMPIChannel,
+	vk CompiledVerifyingKey,
+	statement CompiledStatement,
+	role CompiledMPIRole,
+	partySolution []fr.Element,
+	profile *CompiledMPIProfile,
+) (*CompiledProof, compiledMPITrace, error) {
+	var trace compiledMPITrace
 	isRoot := channel.IsCoordinator()
 	m := vk.Metadata.PartitionCount
 	t := vk.Metadata.LocalDomainSize
@@ -123,6 +271,7 @@ func compiledProveMPIWithTrace(
 
 	// W0: one semantic row commitment share per party, then the aggregate is
 	// broadcast so every rank samples the same initial challenge batch.
+	phaseStarted := time.Now()
 	w0Share := MPIPayload{}
 	if !isRoot {
 		table, _, buildErr := compiledBuildLocalPIOPTableFromSolution(
@@ -152,7 +301,9 @@ func compiledProveMPIWithTrace(
 		}
 	}
 	w0Shape, _ := protocolMPIExpectedShape(ProtocolMPIPhaseW0, protocolMPIOpAggregate, partitions)
+	transportStarted := startCompiledMPITransportProfile(profile)
 	w0Aggregate, err := channel.AggregateWorkers(ProtocolMPIPhaseW0, w0Shape, w0Share)
+	finishCompiledMPITransportProfile(profile, ProtocolMPIPhaseW0, transportStarted)
 	if err != nil {
 		return nil, trace, compiledMPIError("W0 aggregate", err)
 	}
@@ -167,7 +318,9 @@ func compiledProveMPIWithTrace(
 		}
 	}
 	w0BroadcastShape, _ := protocolMPIExpectedShape(ProtocolMPIPhaseW0, protocolMPIOpBroadcast, partitions)
+	transportStarted = startCompiledMPITransportProfile(profile)
 	w0Public, err := channel.RootBroadcast(ProtocolMPIPhaseW0, w0BroadcastShape, w0RootPayload)
+	finishCompiledMPITransportProfile(profile, ProtocolMPIPhaseW0, transportStarted)
 	if err != nil {
 		return nil, trace, compiledMPIError("W0 broadcast", err)
 	}
@@ -187,8 +340,10 @@ func compiledProveMPIWithTrace(
 		EtaX:    initial.EtaX.Value,
 		Gamma:   initial.Gamma.Value,
 	}
+	profile.recordTotal(ProtocolMPIPhaseW0, time.Since(phaseStarted))
 
 	// W1: the local accumulator is fixed before lambda.
+	phaseStarted = time.Now()
 	w1Share := MPIPayload{}
 	if !isRoot {
 		w1, buildErr := fastState.BuildAccumulator(
@@ -207,7 +362,9 @@ func compiledProveMPIWithTrace(
 		}
 	}
 	w1Shape, _ := protocolMPIExpectedShape(ProtocolMPIPhaseW1, protocolMPIOpAggregate, partitions)
+	transportStarted = startCompiledMPITransportProfile(profile)
 	w1Aggregate, err := channel.AggregateWorkers(ProtocolMPIPhaseW1, w1Shape, w1Share)
+	finishCompiledMPITransportProfile(profile, ProtocolMPIPhaseW1, transportStarted)
 	if err != nil {
 		return nil, trace, compiledMPIError("W1 aggregate", err)
 	}
@@ -222,7 +379,9 @@ func compiledProveMPIWithTrace(
 		}
 	}
 	w1BroadcastShape, _ := protocolMPIExpectedShape(ProtocolMPIPhaseW1, protocolMPIOpBroadcast, partitions)
+	transportStarted = startCompiledMPITransportProfile(profile)
 	w1Public, err := channel.RootBroadcast(ProtocolMPIPhaseW1, w1BroadcastShape, w1RootPayload)
+	finishCompiledMPITransportProfile(profile, ProtocolMPIPhaseW1, transportStarted)
 	if err != nil {
 		return nil, trace, compiledMPIError("W1 broadcast", err)
 	}
@@ -238,8 +397,10 @@ func compiledProveMPIWithTrace(
 		return nil, trace, compiledMPIError("lambda", err)
 	}
 	localChallenges.Lambda = lambda.Value
+	profile.recordTotal(ProtocolMPIPhaseW1, time.Since(phaseStarted))
 
 	// W2: three quotient chunks per party.
+	phaseStarted = time.Now()
 	w2Share := MPIPayload{}
 	if !isRoot {
 		relation, err = fastState.BuildQuotient(localChallenges.Lambda)
@@ -259,7 +420,9 @@ func compiledProveMPIWithTrace(
 		}
 	}
 	w2Shape, _ := protocolMPIExpectedShape(ProtocolMPIPhaseW2, protocolMPIOpAggregate, partitions)
+	transportStarted = startCompiledMPITransportProfile(profile)
 	w2Aggregate, err := channel.AggregateWorkers(ProtocolMPIPhaseW2, w2Shape, w2Share)
+	finishCompiledMPITransportProfile(profile, ProtocolMPIPhaseW2, transportStarted)
 	if err != nil {
 		return nil, trace, compiledMPIError("W2 aggregate", err)
 	}
@@ -274,7 +437,9 @@ func compiledProveMPIWithTrace(
 		}
 	}
 	w2BroadcastShape, _ := protocolMPIExpectedShape(ProtocolMPIPhaseW2, protocolMPIOpBroadcast, partitions)
+	transportStarted = startCompiledMPITransportProfile(profile)
 	w2Public, err := channel.RootBroadcast(ProtocolMPIPhaseW2, w2BroadcastShape, w2RootPayload)
+	finishCompiledMPITransportProfile(profile, ProtocolMPIPhaseW2, transportStarted)
 	if err != nil {
 		return nil, trace, compiledMPIError("W2 broadcast", err)
 	}
@@ -290,9 +455,11 @@ func compiledProveMPIWithTrace(
 		return nil, trace, compiledMPIError("alpha", err)
 	}
 	alpha := alphaOut.Value
+	profile.recordTotal(ProtocolMPIPhaseW2, time.Since(phaseStarted))
 
 	// W3: exact 21-field rows are gathered. The root scatters only each
 	// party's t0/t1 coefficients, then broadcasts the complete public suffix.
+	phaseStarted = time.Now()
 	w3Share := MPIPayload{}
 	if !isRoot {
 		terminals, terminalErr := relation.TerminalEvaluations(alpha)
@@ -305,7 +472,9 @@ func compiledProveMPIWithTrace(
 		}
 	}
 	w3GatherShape, _ := protocolMPIExpectedShape(ProtocolMPIPhaseW3, protocolMPIOpGather, partitions)
+	transportStarted = startCompiledMPITransportProfile(profile)
 	w3Gathered, err := channel.GatherWorkers(ProtocolMPIPhaseW3, w3GatherShape, w3Share)
+	finishCompiledMPITransportProfile(profile, ProtocolMPIPhaseW3, transportStarted)
 	if err != nil {
 		return nil, trace, compiledMPIError("W3 gather", err)
 	}
@@ -339,7 +508,9 @@ func compiledProveMPIWithTrace(
 		}
 	}
 	w3ScatterShape, _ := protocolMPIExpectedShape(ProtocolMPIPhaseW3, protocolMPIOpScatter, partitions)
+	transportStarted = startCompiledMPITransportProfile(profile)
 	w3LocalPairPayload, err := channel.RootScatter(ProtocolMPIPhaseW3, w3ScatterShape, scatterPayloads)
+	finishCompiledMPITransportProfile(profile, ProtocolMPIPhaseW3, transportStarted)
 	if err != nil {
 		return nil, trace, compiledMPIError("W3 scatter", err)
 	}
@@ -362,7 +533,9 @@ func compiledProveMPIWithTrace(
 		}
 	}
 	w3BroadcastShape, _ := protocolMPIExpectedShape(ProtocolMPIPhaseW3, protocolMPIOpBroadcast, partitions)
+	transportStarted = startCompiledMPITransportProfile(profile)
 	w3PublicPayload, err := channel.RootBroadcast(ProtocolMPIPhaseW3, w3BroadcastShape, w3RootPayload)
+	finishCompiledMPITransportProfile(profile, ProtocolMPIPhaseW3, transportStarted)
 	if err != nil {
 		return nil, trace, compiledMPIError("W3 broadcast", err)
 	}
@@ -387,6 +560,7 @@ func compiledProveMPIWithTrace(
 		}
 	}
 	trace.Outer = TranscriptDigest(outer.Digest())
+	profile.recordTotal(ProtocolMPIPhaseW3, time.Since(phaseStarted))
 
 	// Build the common opening instance. Parties additionally retain only
 	// their three local compressed source polynomials.
@@ -442,6 +616,7 @@ func compiledProveMPIWithTrace(
 	}
 
 	// U0: weighted translated local source commitments.
+	phaseStarted = time.Now()
 	var openingPartyState compiledMPIOpeningPartyState
 	u0Share := MPIPayload{}
 	if !isRoot {
@@ -458,7 +633,9 @@ func compiledProveMPIWithTrace(
 		}
 	}
 	u0Shape, _ := protocolMPIExpectedShape(ProtocolMPIPhaseU0, protocolMPIOpAggregate, partitions)
+	transportStarted = startCompiledMPITransportProfile(profile)
 	u0Aggregate, err := channel.AggregateWorkers(ProtocolMPIPhaseU0, u0Shape, u0Share)
+	finishCompiledMPITransportProfile(profile, ProtocolMPIPhaseU0, transportStarted)
 	if err != nil {
 		return nil, trace, compiledMPIError("U0 aggregate", err)
 	}
@@ -473,7 +650,9 @@ func compiledProveMPIWithTrace(
 		}
 	}
 	u0BroadcastShape, _ := protocolMPIExpectedShape(ProtocolMPIPhaseU0, protocolMPIOpBroadcast, partitions)
+	transportStarted = startCompiledMPITransportProfile(profile)
 	u0PublicPayload, err := channel.RootBroadcast(ProtocolMPIPhaseU0, u0BroadcastShape, u0RootPayload)
+	finishCompiledMPITransportProfile(profile, ProtocolMPIPhaseU0, transportStarted)
 	if err != nil {
 		return nil, trace, compiledMPIError("U0 broadcast", err)
 	}
@@ -497,9 +676,11 @@ func compiledProveMPIWithTrace(
 		return nil, trace, compiledMPIError("z challenge", err)
 	}
 	xi, nu, zChallenge := xiOut.Value, nuOut.Value, zOut.Value
+	profile.recordTotal(ProtocolMPIPhaseU0, time.Since(phaseStarted))
 
 	// U1: parties reveal only d_i[3] and one Laurent commitment. The root
 	// reconstructs h_xi coefficients and both public commitments.
+	phaseStarted = time.Now()
 	u1Share := MPIPayload{}
 	if !isRoot {
 		d, laurentCommitment, shareErr := compiledMPIOpeningU1Share(
@@ -515,7 +696,9 @@ func compiledProveMPIWithTrace(
 		}
 	}
 	u1GatherShape, _ := protocolMPIExpectedShape(ProtocolMPIPhaseU1, protocolMPIOpGather, partitions)
+	transportStarted = startCompiledMPITransportProfile(profile)
 	u1Gathered, err := channel.GatherWorkers(ProtocolMPIPhaseU1, u1GatherShape, u1Share)
+	finishCompiledMPITransportProfile(profile, ProtocolMPIPhaseU1, transportStarted)
 	if err != nil {
 		return nil, trace, compiledMPIError("U1 gather", err)
 	}
@@ -551,7 +734,9 @@ func compiledProveMPIWithTrace(
 		}
 	}
 	u1BroadcastShape, _ := protocolMPIExpectedShape(ProtocolMPIPhaseU1, protocolMPIOpBroadcast, partitions)
+	transportStarted = startCompiledMPITransportProfile(profile)
 	u1PublicPayload, err := channel.RootBroadcast(ProtocolMPIPhaseU1, u1BroadcastShape, u1RootPayload)
+	finishCompiledMPITransportProfile(profile, ProtocolMPIPhaseU1, transportStarted)
 	if err != nil {
 		return nil, trace, compiledMPIError("U1 broadcast", err)
 	}
@@ -571,9 +756,11 @@ func compiledProveMPIWithTrace(
 		return nil, trace, compiledMPIError("beta exclusion", err)
 	}
 	betaInverse := dlinkzgOpeningInverse(beta)
+	profile.recordTotal(ProtocolMPIPhaseU1, time.Since(phaseStarted))
 
 	// U2: six g evaluations and S_i(beta) are additive shares. The root
 	// evaluates h_xi,t0,t1 itself and derives the canonical S(beta^-1).
+	phaseStarted = time.Now()
 	u2Share := MPIPayload{}
 	if !isRoot {
 		shareValues, shareErr := compiledMPIOpeningU2Share(&openingPartyState, beta)
@@ -592,7 +779,9 @@ func compiledProveMPIWithTrace(
 		}
 	}
 	u2Shape, _ := protocolMPIExpectedShape(ProtocolMPIPhaseU2, protocolMPIOpAggregate, partitions)
+	transportStarted = startCompiledMPITransportProfile(profile)
 	u2AggregatePayload, err := channel.AggregateWorkers(ProtocolMPIPhaseU2, u2Shape, u2Share)
+	finishCompiledMPITransportProfile(profile, ProtocolMPIPhaseU2, transportStarted)
 	if err != nil {
 		return nil, trace, compiledMPIError("U2 aggregate", err)
 	}
@@ -628,7 +817,9 @@ func compiledProveMPIWithTrace(
 		}
 	}
 	u2BroadcastShape, _ := protocolMPIExpectedShape(ProtocolMPIPhaseU2, protocolMPIOpBroadcast, partitions)
+	transportStarted = startCompiledMPITransportProfile(profile)
 	u2PublicPayload, err := channel.RootBroadcast(ProtocolMPIPhaseU2, u2BroadcastShape, u2RootPayload)
+	finishCompiledMPITransportProfile(profile, ProtocolMPIPhaseU2, transportStarted)
 	if err != nil {
 		return nil, trace, compiledMPIError("U2 broadcast", err)
 	}
@@ -652,8 +843,10 @@ func compiledProveMPIWithTrace(
 	if kappa.IsZero() {
 		return nil, trace, compiledMPIError("kappa", ErrDLinkZGOpeningRejected)
 	}
+	profile.recordTotal(ProtocolMPIPhaseU2, time.Since(phaseStarted))
 
 	// U3: parties aggregate WG,WL,PiZ; PiY is coordinator-only.
+	phaseStarted = time.Now()
 	u3Share := MPIPayload{}
 	if !isRoot {
 		shares, shareErr := compiledMPIOpeningU3Share(
@@ -670,7 +863,9 @@ func compiledProveMPIWithTrace(
 		}
 	}
 	u3Shape, _ := protocolMPIExpectedShape(ProtocolMPIPhaseU3, protocolMPIOpAggregate, partitions)
+	transportStarted = startCompiledMPITransportProfile(profile)
 	u3AggregatePayload, err := channel.AggregateWorkers(ProtocolMPIPhaseU3, u3Shape, u3Share)
+	finishCompiledMPITransportProfile(profile, ProtocolMPIPhaseU3, transportStarted)
 	if err != nil {
 		return nil, trace, compiledMPIError("U3 aggregate", err)
 	}
@@ -696,7 +891,9 @@ func compiledProveMPIWithTrace(
 		}
 	}
 	u3BroadcastShape, _ := protocolMPIExpectedShape(ProtocolMPIPhaseU3, protocolMPIOpBroadcast, partitions)
+	transportStarted = startCompiledMPITransportProfile(profile)
 	u3PublicPayload, err := channel.RootBroadcast(ProtocolMPIPhaseU3, u3BroadcastShape, u3RootPayload)
+	finishCompiledMPITransportProfile(profile, ProtocolMPIPhaseU3, transportStarted)
 	if err != nil {
 		return nil, trace, compiledMPIError("U3 broadcast", err)
 	}
@@ -715,6 +912,7 @@ func compiledProveMPIWithTrace(
 		return nil, trace, compiledMPIError("delta", ErrDLinkZGOpeningRejected)
 	}
 	trace.Opening = TranscriptDigest(openingTranscript.Digest())
+	profile.recordTotal(ProtocolMPIPhaseU3, time.Since(phaseStarted))
 	if isRoot {
 		return &publicProof, trace, nil
 	}
@@ -728,6 +926,17 @@ func validateCompiledMPIRole(
 	role CompiledMPIRole,
 	partySolution []fr.Element,
 ) error {
+	if err := validateCompiledMPIStaticRole(channel, vk, role); err != nil {
+		return err
+	}
+	return validateCompiledMPIDynamicInput(vk, statement, role, partySolution)
+}
+
+func validateCompiledMPIStaticRole(
+	channel *ProtocolMPIChannel,
+	vk CompiledVerifyingKey,
+	role CompiledMPIRole,
+) error {
 	if channel == nil {
 		return fmt.Errorf("%w: nil channel", ErrInvalidCompiledMPIRole)
 	}
@@ -737,12 +946,9 @@ func validateCompiledMPIRole(
 	if uint64(vk.Metadata.PartitionCount) != channel.PartitionCount() {
 		return fmt.Errorf("%w: VK M=%d, channel M=%d", ErrInvalidCompiledMPIRole, vk.Metadata.PartitionCount, channel.PartitionCount())
 	}
-	if err := validateCompiledStatement(vk.Metadata, vk.Verifier.PublicInputPlacement, statement); err != nil {
-		return err
-	}
 	if channel.IsCoordinator() {
-		if role.Coordinator == nil || role.Party != nil || len(partySolution) != 0 {
-			return fmt.Errorf("%w: rank zero must own only the coordinator role and no solution", ErrInvalidCompiledMPIRole)
+		if role.Coordinator == nil || role.Party != nil {
+			return fmt.Errorf("%w: rank zero must own only the coordinator role", ErrInvalidCompiledMPIRole)
 		}
 		coordinator := role.Coordinator
 		if coordinator.Metadata != vk.Metadata || coordinator.SRS == nil ||
@@ -790,6 +996,29 @@ func validateCompiledMPIRole(
 		TranscriptDigest(sparseR1CSAdapterDigest(party.ConstraintSystem)) != vk.Metadata.CircuitDigest {
 		return fmt.Errorf("%w: party circuit is not the authenticated setup circuit", ErrInvalidCompiledMPIRole)
 	}
+	return nil
+}
+
+func validateCompiledMPIDynamicInput(
+	vk CompiledVerifyingKey,
+	statement CompiledStatement,
+	role CompiledMPIRole,
+	partySolution []fr.Element,
+) error {
+	if err := validateCompiledStatement(vk.Metadata, vk.Verifier.PublicInputPlacement, statement); err != nil {
+		return err
+	}
+	if role.Coordinator != nil {
+		if role.Party != nil || len(partySolution) != 0 {
+			return fmt.Errorf("%w: rank zero must own no party role or solution", ErrInvalidCompiledMPIRole)
+		}
+		return nil
+	}
+	if role.Party == nil || role.Coordinator != nil {
+		return fmt.Errorf("%w: party rank must own exactly one party role", ErrInvalidCompiledMPIRole)
+	}
+	party := role.Party
+	layout := party.Preprocessing.layout
 	if len(partySolution) != layout.variables {
 		return fmt.Errorf("%w: party solution has %d variables, want %d", ErrInvalidCompiledMPIRole, len(partySolution), layout.variables)
 	}
