@@ -279,6 +279,106 @@ func TestSparseR1CSAdapterPreprocessingIsolationAndBinding(t *testing.T) {
 	}
 }
 
+func TestSparseR1CSAdapterBatchPreprocessingMatchesIndividual(t *testing.T) {
+	spr, witness := compileLocalPIOPAdapterCircuit(t, 16, 2, fr.Element{})
+	proverConfig, err := backend.NewProverConfig()
+	if err != nil {
+		t.Fatalf("prover config: %v", err)
+	}
+	solution, err := spr.Solve(witness, proverConfig)
+	if err != nil {
+		t.Fatalf("solve fixture: %v", err)
+	}
+
+	for _, world := range []int{2, 4} {
+		t.Run(adapterWorldName(world), func(t *testing.T) {
+			batch, err := PreprocessAllLocalPIOP(spr, world)
+			if err != nil {
+				t.Fatalf("batch preprocess: %v", err)
+			}
+			if len(batch) != world {
+				t.Fatalf("batch length = %d, want %d", len(batch), world)
+			}
+			for rank := 0; rank < world; rank++ {
+				individual, err := PreprocessLocalPIOP(spr, rank, world)
+				if err != nil {
+					t.Fatalf("individual rank %d: %v", rank, err)
+				}
+				assertLocalPIOPAdapterPreprocessingEqual(t, batch[rank], individual)
+
+				batchTable, batchIndex, err := BuildLocalPIOPTableFromSolution(batch[rank], spr, solution)
+				if err != nil {
+					t.Fatalf("batch online table rank %d: %v", rank, err)
+				}
+				individualTable, individualIndex, err := BuildLocalPIOPTableFromSolution(individual, spr, solution)
+				if err != nil {
+					t.Fatalf("individual online table rank %d: %v", rank, err)
+				}
+				assertLocalPIOPAdapterTableEqual(t, batchTable, individualTable)
+				assertLocalFieldEqual(t, batchIndex.SlotLabel, individualIndex.SlotLabel, "batch slot label")
+				for wire := 0; wire < LocalWireCount; wire++ {
+					assertLocalFieldEqual(
+						t, batchIndex.WireCosets[wire], individualIndex.WireCosets[wire], "batch wire coset",
+					)
+				}
+			}
+		})
+	}
+}
+
+func TestSparseR1CSAdapterBatchPreprocessingDoesNotAliasRanks(t *testing.T) {
+	spr, _ := compileLocalPIOPAdapterCircuit(t, 16, 2, fr.Element{})
+	batch, err := PreprocessAllLocalPIOP(spr, 4)
+	if err != nil {
+		t.Fatalf("batch preprocess: %v", err)
+	}
+	if batch[0] == batch[1] {
+		t.Fatal("rank preprocessings alias")
+	}
+	rankOneSnapshot := batch[1].FixedTable()
+	batch[0].fixed.Selectors[LocalSelectorL][0].Add(
+		&batch[0].fixed.Selectors[LocalSelectorL][0], valuePointer(fr.One()),
+	)
+	batch[0].fixed.SigmaX[LocalWireA][0].Add(
+		&batch[0].fixed.SigmaX[LocalWireA][0], valuePointer(fr.One()),
+	)
+	batch[0].fixed.SigmaPart[LocalWireA][0].Add(
+		&batch[0].fixed.SigmaPart[LocalWireA][0], valuePointer(fr.One()),
+	)
+	assertLocalPIOPAdapterFixedColumnsEqual(t, batch[1].FixedTable(), rankOneSnapshot)
+}
+
+func TestSparseR1CSAdapterBatchPreprocessingRejectsMalformedInputs(t *testing.T) {
+	spr, _ := compileLocalPIOPAdapterCircuit(t, 8, 2, fr.Element{})
+	tests := []struct {
+		name      string
+		system    *cs.SparseR1CS
+		world     int
+		wantError error
+	}{
+		{name: "nil system", system: nil, world: 2, wantError: ErrMalformedSparseR1CS},
+		{name: "zero world", system: spr, world: 0, wantError: ErrInvalidLocalPIOPAdapterConfig},
+		{name: "non-power-of-two world", system: spr, world: 3, wantError: ErrInvalidLocalPIOPAdapterConfig},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			result, err := PreprocessAllLocalPIOP(test.system, test.world)
+			if !errors.Is(err, test.wantError) {
+				t.Fatalf("error = %v, want %v", err, test.wantError)
+			}
+			if result != nil {
+				t.Fatalf("malformed batch returned %d roles", len(result))
+			}
+		})
+	}
+
+	malformed := *spr
+	malformed.Coefficients = nil
+	if result, err := PreprocessAllLocalPIOP(&malformed, 2); !errors.Is(err, ErrMalformedSparseR1CS) || result != nil {
+		t.Fatalf("malformed-system result length/error = %d/%v", len(result), err)
+	}
+}
+
 func TestSparseR1CSAdapterFixedPreprocessingIsWitnessIndependent(t *testing.T) {
 	const rounds = 8
 	system, err := frontend.Compile(ecc.BN254, scs.NewBuilder, &localPIOPAdapterCircuit{rounds: rounds})
@@ -731,6 +831,30 @@ func assertLocalPIOPAdapterFixedColumnsEqual(t *testing.T, got, want LocalPIOPTa
 			assertLocalFieldEqual(t, got.Selectors[selector][row], want.Selectors[selector][row], "fixed selector")
 		}
 	}
+}
+
+func assertLocalPIOPAdapterPreprocessingEqual(
+	t *testing.T,
+	got, want *LocalPIOPPreprocessing,
+) {
+	t.Helper()
+	if got == nil || want == nil {
+		t.Fatalf("nil preprocessing: got=%v want=%v", got == nil, want == nil)
+	}
+	if got.rank != want.rank || got.world != want.world || got.layout != want.layout ||
+		got.systemDigest != want.systemDigest {
+		t.Fatalf(
+			"preprocessing metadata differs: got rank/world %d/%d, want %d/%d",
+			got.rank, got.world, want.rank, want.world,
+		)
+	}
+	assertLocalFieldEqual(t, got.index.SlotLabel, want.index.SlotLabel, "preprocessing slot label")
+	for wire := 0; wire < LocalWireCount; wire++ {
+		assertLocalFieldEqual(
+			t, got.index.WireCosets[wire], want.index.WireCosets[wire], "preprocessing wire coset",
+		)
+	}
+	assertLocalPIOPAdapterFixedColumnsEqual(t, got.fixed, want.fixed)
 }
 
 func localPIOPAdapterTagValue(wire, partition, row fr.Element, challenges LocalPIOPChallenges) fr.Element {

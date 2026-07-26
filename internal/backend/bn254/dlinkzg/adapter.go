@@ -235,6 +235,63 @@ func PreprocessLocalPIOP(
 	return preprocessing, nil
 }
 
+// PreprocessAllLocalPIOP constructs the complete manifest-ordered fixed state
+// for all ranks in one batch. SparseR1CS structure validation and hashing are
+// performed once, and the global L || R || O permutation stream is scanned
+// once for all ranks. The total work and retained output are O(MT); no rank
+// aliases another rank's fixed-table slices.
+func PreprocessAllLocalPIOP(
+	spr *cs.SparseR1CS,
+	world int,
+) (preprocessings []*LocalPIOPPreprocessing, err error) {
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			preprocessings = nil
+			err = fmt.Errorf("%w: panic while batch preprocessing tables: %v", ErrMalformedSparseR1CS, recovered)
+		}
+	}()
+
+	layout, err := validateSparseR1CSAdapterStructure(spr, 0, world)
+	if err != nil {
+		return nil, err
+	}
+	localOmega, err := sparseR1CSAdapterRoot(layout.localRows)
+	if err != nil {
+		return nil, err
+	}
+	systemDigest := sparseR1CSAdapterDigest(spr)
+	destinations, err := streamAllLocalPermutationDestinations(spr, world, layout)
+	if err != nil {
+		return nil, err
+	}
+
+	preprocessings = make([]*LocalPIOPPreprocessing, world)
+	for rank := 0; rank < world; rank++ {
+		preprocessing := &LocalPIOPPreprocessing{
+			rank:         rank,
+			world:        world,
+			layout:       layout,
+			systemDigest: systemDigest,
+			fixed:        allocateLocalPIOPAdapterFixedTable(layout.localRows),
+		}
+		preprocessing.index.SlotLabel.SetUint64(uint64(rank))
+		preprocessing.index.WireCosets[LocalWireA].SetOne()
+		preprocessing.index.WireCosets[LocalWireB].SetUint64(5)
+		preprocessing.index.WireCosets[LocalWireC].Square(&preprocessing.index.WireCosets[LocalWireB])
+		fillLocalPIOPAdapterFixedRows(&preprocessing.fixed, spr, rank, layout)
+		fillLocalPIOPAdapterDestinations(
+			&preprocessing.fixed,
+			destinations[rank],
+			preprocessing.index,
+			localOmega,
+			world,
+			layout,
+		)
+		preprocessings[rank] = preprocessing
+	}
+	return preprocessings, nil
+}
+
 // BuildLocalPIOPTableFromSolution performs only the online, solution-dependent
 // assembly. It deep-copies the preprocessed fixed columns and fills Wires and
 // PublicInput from the read-only full solution vector. The structural digest
@@ -596,6 +653,63 @@ func streamLocalPermutationDestinations(
 				)
 			}
 			destinations[wire][localRow] = lastPosition[variable]
+		}
+	}
+	return destinations, nil
+}
+
+// streamAllLocalPermutationDestinations is the batched counterpart of
+// streamLocalPermutationDestinations. It records each occurrence's predecessor
+// during one global scan, then closes every first occurrence to its variable's
+// final position in one linear pass over the manifest-ordered output.
+func streamAllLocalPermutationDestinations(
+	spr *cs.SparseR1CS,
+	world int,
+	layout localPIOPAdapterLayout,
+) ([][LocalWireCount][]int64, error) {
+	destinations := make([][LocalWireCount][]int64, world)
+	for rank := 0; rank < world; rank++ {
+		for wire := 0; wire < LocalWireCount; wire++ {
+			destinations[rank][wire] = make([]int64, layout.localRows)
+			for row := range destinations[rank][wire] {
+				destinations[rank][wire][row] = -1
+			}
+		}
+	}
+
+	lastPosition := make([]int64, layout.variables)
+	for variable := range lastPosition {
+		lastPosition[variable] = -1
+	}
+	for wire := 0; wire < LocalWireCount; wire++ {
+		for globalRow := 0; globalRow < layout.totalRows; globalRow++ {
+			variable := sparseR1CSAdapterVariableAt(spr, wire, globalRow, layout)
+			position := int64(wire)*int64(layout.totalRows) + int64(globalRow)
+			if lastPosition[variable] != -1 {
+				rank := globalRow / layout.localRows
+				row := globalRow % layout.localRows
+				destinations[rank][wire][row] = lastPosition[variable]
+			}
+			lastPosition[variable] = position
+		}
+	}
+
+	for rank := 0; rank < world; rank++ {
+		for wire := 0; wire < LocalWireCount; wire++ {
+			for row := 0; row < layout.localRows; row++ {
+				if destinations[rank][wire][row] != -1 {
+					continue
+				}
+				globalRow := rank*layout.localRows + row
+				variable := sparseR1CSAdapterVariableAt(spr, wire, globalRow, layout)
+				if lastPosition[variable] < 0 {
+					return nil, fmt.Errorf(
+						"%w: variable %d has no permutation occurrence",
+						ErrMalformedSparseR1CS, variable,
+					)
+				}
+				destinations[rank][wire][row] = lastPosition[variable]
+			}
 		}
 	}
 	return destinations, nil
