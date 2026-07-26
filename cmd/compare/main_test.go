@@ -92,6 +92,23 @@ func TestInitializeMPIWorldSingleProcessAndMissingDistributedEnvironment(t *test
 	if err := initializeMPIWorld(validTestConfig("dlinkzg", 2)); err == nil {
 		t.Fatal("distributed initialization without PIANIST_MPI_* was accepted")
 	}
+
+	// The legacy Pianist DKZG package normally initializes simpleMPI before
+	// main. Dummy paths prove that initializeMPIWorld does not try to launch a
+	// second root or worker when the runtime already has a nonzero world.
+	t.Setenv("PIANIST_MPI_IP_FILE", "/does/not/exist/ip.txt")
+	t.Setenv("PIANIST_MPI_SSH_KEY", "/does/not/exist/key")
+	t.Setenv("PIANIST_MPI_SSH_USER", "nobody")
+	mpi.SelfRank = 0
+	mpi.WorldSize = 3
+	if err := initializeMPIWorld(validTestConfig("dlinkzg", 2)); err != nil {
+		t.Fatalf("reuse initialized root world: %v", err)
+	}
+	os.Args = []string{"compare", "127.0.0.1", "9999", "Slave"}
+	mpi.SelfRank = 1
+	if err := initializeMPIWorld(validTestConfig("dlinkzg", 2)); err != nil {
+		t.Fatalf("reuse initialized worker world: %v", err)
+	}
 }
 
 func testTranscriptDigest(tag byte) dlinkzgbackend.TranscriptDigest {

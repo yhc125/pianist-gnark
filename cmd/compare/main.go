@@ -114,6 +114,13 @@ func initializeMPIWorld(cfg config) error {
 		return fmt.Errorf("unknown backend %q", cfg.backend)
 	}
 	if isMPIWorkerProcess() {
+		// Pianist's DKZG dependency initializes simpleMPI from its package init
+		// before main. Avoid starting a second worker connection when that has
+		// already happened; keep the explicit call as a fallback for builds that
+		// remove that legacy initializer.
+		if mpi.WorldSize != 0 {
+			return nil
+		}
 		mpi.WorldInit("", "", "")
 		return nil
 	}
@@ -122,6 +129,12 @@ func initializeMPIWorld(cfg config) error {
 	sshUser := os.Getenv("PIANIST_MPI_SSH_USER")
 	if ipFile == "" || sshKey == "" || sshUser == "" {
 		return errors.New("distributed backend needs all PIANIST_MPI_* variables")
+	}
+	// The imported Pianist DKZG package normally initialized the root before
+	// main. Calling WorldInit twice relaunches every SSH worker and invalidates
+	// the first set of connections, so only initialize an empty runtime here.
+	if mpi.WorldSize != 0 {
+		return nil
 	}
 	mpi.WorldInit(ipFile, sshKey, sshUser)
 	return nil
