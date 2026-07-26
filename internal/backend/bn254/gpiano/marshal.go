@@ -20,16 +20,58 @@ package gpiano
 import (
 	"fmt"
 	"io"
+
+	curve "github.com/consensys/gnark-crypto/ecc/bn254"
 )
 
 // WriteTo writes binary encoding of Proof to w
 func (proof *Proof) WriteTo(w io.Writer) (int64, error) {
-	return 0, fmt.Errorf("not implemented")
+	enc := curve.NewEncoder(w)
+	toEncode := []interface{}{
+		&proof.LRO[0], &proof.LRO[1], &proof.LRO[2],
+		&proof.Z, &proof.W,
+		&proof.Hx[0], &proof.Hx[1], &proof.Hx[2], &proof.Hx[3],
+		&proof.Hy[0], &proof.Hy[1], &proof.Hy[2], &proof.Hy[3],
+		&proof.PartialBatchedProof.H,
+		proof.PartialBatchedProof.ClaimedDigests,
+		&proof.PartialZShiftedProof.H,
+		&proof.PartialZShiftedProof.ClaimedDigest,
+		&proof.BatchedProof.H,
+		proof.BatchedProof.ClaimedValues,
+		&proof.WShiftedProof.H,
+		&proof.WShiftedProof.ClaimedValue,
+	}
+	for _, value := range toEncode {
+		if err := enc.Encode(value); err != nil {
+			return enc.BytesWritten(), err
+		}
+	}
+	return enc.BytesWritten(), nil
 }
 
 // ReadFrom reads binary representation of Proof from r
 func (proof *Proof) ReadFrom(r io.Reader) (int64, error) {
-	return 0, fmt.Errorf("not implemented")
+	dec := curve.NewDecoder(r)
+	toDecode := []interface{}{
+		&proof.LRO[0], &proof.LRO[1], &proof.LRO[2],
+		&proof.Z, &proof.W,
+		&proof.Hx[0], &proof.Hx[1], &proof.Hx[2], &proof.Hx[3],
+		&proof.Hy[0], &proof.Hy[1], &proof.Hy[2], &proof.Hy[3],
+		&proof.PartialBatchedProof.H,
+		&proof.PartialBatchedProof.ClaimedDigests,
+		&proof.PartialZShiftedProof.H,
+		&proof.PartialZShiftedProof.ClaimedDigest,
+		&proof.BatchedProof.H,
+		&proof.BatchedProof.ClaimedValues,
+		&proof.WShiftedProof.H,
+		&proof.WShiftedProof.ClaimedValue,
+	}
+	for _, value := range toDecode {
+		if err := dec.Decode(value); err != nil {
+			return dec.BytesRead(), err
+		}
+	}
+	return dec.BytesRead(), nil
 }
 
 // WriteTo writes binary encoding of ProvingKey to w

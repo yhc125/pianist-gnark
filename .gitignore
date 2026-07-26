@@ -49,3 +49,6 @@ gnarkd/circuits/**
 *.sage.py
 
 **/output
+.build/
+/compare
+/dlinkzg-mpi-smoke

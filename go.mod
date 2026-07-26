@@ -28,3 +28,5 @@ require (
 )
 
 replace github.com/consensys/gnark-crypto => ../pianist-gnark-crypto
+
+replace github.com/sunblaze-ucb/simpleMPI => ../simpleMPI

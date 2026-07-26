@@ -20,6 +20,8 @@ package plonk
 
 import (
 	"crypto/sha256"
+	"errors"
+	"fmt"
 	"math/big"
 	"math/bits"
 	"runtime"
@@ -61,8 +63,63 @@ type Proof struct {
 	ZShiftedOpening kzg.OpeningProof
 }
 
-// Prove from the public data
+// ErrInvalidSolution is returned when ProveWithSolution receives a nil,
+// malformed, or circuit-mismatched precomputed solution.
+var ErrInvalidSolution = errors.New("plonk: invalid precomputed solution")
+
+// Solution is the constraint-system solution consumed by the cryptographic
+// prover. It is intentionally opaque so a solution cannot accidentally be
+// reused with a different curve-specific constraint system.
+type Solution struct {
+	system     *cs.SparseR1CS
+	wireValues []fr.Element
+}
+
+// Solve computes the constraint-system solution used by ProveWithSolution.
+// All prover options currently affect only this phase.
+func Solve(spr *cs.SparseR1CS, fullWitness bn254witness.Witness, opt backend.ProverConfig) (*Solution, error) {
+	wireValues, err := spr.Solve(fullWitness, opt)
+	if err != nil {
+		if !opt.Force {
+			return nil, err
+		} else {
+			// we need to fill solution with random values
+			var r fr.Element
+			_, _ = r.SetRandom()
+			for i := spr.NbPublicVariables + spr.NbSecretVariables; i < len(wireValues); i++ {
+				wireValues[i] = r
+				r.Double(&r)
+			}
+		}
+	}
+	return &Solution{system: spr, wireValues: wireValues}, nil
+}
+
+// Prove from the public data.
 func Prove(spr *cs.SparseR1CS, pk *ProvingKey, fullWitness bn254witness.Witness, opt backend.ProverConfig) (*Proof, error) {
+	solution, err := Solve(spr, fullWitness, opt)
+	if err != nil {
+		return nil, err
+	}
+	return ProveWithSolution(spr, pk, solution)
+}
+
+// ProveWithSolution runs only the cryptographic proving phase using a solution
+// previously returned by Solve. The public inputs are read from the solution's
+// witness prefix, which is identical to the input used by the original Prove
+// path.
+func ProveWithSolution(spr *cs.SparseR1CS, pk *ProvingKey, solution *Solution) (*Proof, error) {
+	if solution == nil {
+		return nil, fmt.Errorf("%w: nil solution", ErrInvalidSolution)
+	}
+	if solution.system != spr {
+		return nil, fmt.Errorf("%w: constraint system mismatch", ErrInvalidSolution)
+	}
+	expected := spr.NbPublicVariables + spr.NbSecretVariables + spr.NbInternalVariables
+	if len(solution.wireValues) != expected {
+		return nil, fmt.Errorf("%w: got %d wires, expected %d", ErrInvalidSolution, len(solution.wireValues), expected)
+	}
+	wireValues := solution.wireValues
 
 	log := logger.Logger().With().Str("curve", spr.CurveID().String()).Int("nbConstraints", len(spr.Constraints)).Str("backend", "plonk").Logger()
 	start := time.Now()
@@ -75,25 +132,8 @@ func Prove(spr *cs.SparseR1CS, pk *ProvingKey, fullWitness bn254witness.Witness,
 	// result
 	proof := &Proof{}
 
-	// compute the constraint system solution
-	var solution []fr.Element
-	var err error
-	if solution, err = spr.Solve(fullWitness, opt); err != nil {
-		if !opt.Force {
-			return nil, err
-		} else {
-			// we need to fill solution with random values
-			var r fr.Element
-			_, _ = r.SetRandom()
-			for i := spr.NbPublicVariables + spr.NbSecretVariables; i < len(solution); i++ {
-				solution[i] = r
-				r.Double(&r)
-			}
-		}
-	}
-
 	// query l, r, o in Lagrange basis, not blinded
-	evaluationLDomainSmall, evaluationRDomainSmall, evaluationODomainSmall := evaluateLROSmallDomain(spr, pk, solution)
+	evaluationLDomainSmall, evaluationRDomainSmall, evaluationODomainSmall := evaluateLROSmallDomain(spr, pk, wireValues)
 
 	// save ll, lr, lo, and make a copy of them in canonical basis.
 	// note that we allocate more capacity to reuse for blinded polynomials
@@ -114,7 +154,7 @@ func Prove(spr *cs.SparseR1CS, pk *ProvingKey, fullWitness bn254witness.Witness,
 	// The first challenge is derived using the public data: the commitments to the permutation,
 	// the coefficients of the circuit, and the public inputs.
 	// derive gamma from the Comm(blinded cl), Comm(blinded cr), Comm(blinded co)
-	if err := bindPublicData(&fs, "gamma", *pk.Vk, fullWitness[:spr.NbPublicVariables]); err != nil {
+	if err := bindPublicData(&fs, "gamma", *pk.Vk, wireValues[:spr.NbPublicVariables]); err != nil {
 		return nil, err
 	}
 	bgamma, err := fs.ComputeChallenge("gamma")
@@ -157,7 +197,7 @@ func Prove(spr *cs.SparseR1CS, pk *ProvingKey, fullWitness bn254witness.Witness,
 	}
 
 	qkCompletedCanonical := make([]fr.Element, pk.Domain[0].Cardinality)
-	copy(qkCompletedCanonical, fullWitness[:spr.NbPublicVariables])
+	copy(qkCompletedCanonical, wireValues[:spr.NbPublicVariables])
 	copy(qkCompletedCanonical[spr.NbPublicVariables:], pk.LQk[spr.NbPublicVariables:])
 	pk.Domain[0].FFTInverse(qkCompletedCanonical, fft.DIF)
 	fft.BitReverse(qkCompletedCanonical)

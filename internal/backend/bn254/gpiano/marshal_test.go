@@ -20,6 +20,8 @@ import (
 	curve "github.com/consensys/gnark-crypto/ecc/bn254"
 
 	"github.com/consensys/gnark-crypto/ecc/bn254/fr"
+	"github.com/consensys/gnark-crypto/ecc/bn254/fr/dkzg"
+	"github.com/consensys/gnark-crypto/ecc/bn254/fr/kzg"
 
 	"bytes"
 	"reflect"
@@ -138,5 +140,55 @@ func TestVerifyingKeySerialization(t *testing.T) {
 
 	if written != read {
 		t.Fatal("bytes written / read don't match")
+	}
+}
+
+func TestProofSerialization(t *testing.T) {
+	_, _, generator, _ := curve.Generators()
+	value := fr.NewElement(42)
+	proof := Proof{
+		PartialBatchedProof: dkzg.BatchOpeningProof{
+			ClaimedDigests: make([]curve.G1Affine, 16),
+		},
+		BatchedProof: kzg.BatchOpeningProof{
+			ClaimedValues: make([]fr.Element, 19),
+		},
+	}
+	proof.LRO[0] = generator
+	proof.Z = generator
+	proof.Hx[3] = generator
+	proof.Hy[2] = generator
+	proof.PartialBatchedProof.H = generator
+	proof.PartialBatchedProof.ClaimedDigests[7] = generator
+	proof.PartialZShiftedProof.H = generator
+	proof.PartialZShiftedProof.ClaimedDigest = generator
+	proof.BatchedProof.H = generator
+	proof.BatchedProof.ClaimedValues[11] = value
+	proof.WShiftedProof.H = generator
+	proof.WShiftedProof.ClaimedValue = value
+
+	var buffer bytes.Buffer
+	written, err := proof.WriteTo(&buffer)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if written != int64(buffer.Len()) {
+		t.Fatalf("writer reported %d bytes for a %d-byte buffer", written, buffer.Len())
+	}
+	const expectedCompressedBytes = 1736 // 34 G1 + 20 Fr + two uint32 slice lengths.
+	if written != expectedCompressedBytes {
+		t.Fatalf("proof encoding has %d bytes, want %d", written, expectedCompressedBytes)
+	}
+
+	var decoded Proof
+	read, err := decoded.ReadFrom(&buffer)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if read != written {
+		t.Fatalf("read %d bytes after writing %d", read, written)
+	}
+	if !reflect.DeepEqual(proof, decoded) {
+		t.Fatal("decoded proof differs from encoded proof")
 	}
 }
