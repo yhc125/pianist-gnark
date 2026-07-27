@@ -1285,8 +1285,15 @@ func compiledMPIOpeningU2Share(
 	var result [7]fr.Element
 	betaInverse := dlinkzgOpeningInverse(beta)
 	for claim := 0; claim < dlinkzgOpeningCircuitClaims; claim++ {
-		result[2*claim] = cryptodlinkzg.Eval(state.local.g[claim], beta)
-		result[2*claim+1] = cryptodlinkzg.Eval(state.local.g[claim], betaInverse)
+		state.local.gAtBeta[claim] = cryptodlinkzg.Eval(state.local.g[claim], beta)
+		state.local.gAtBetaInverse[claim] = cryptodlinkzg.Eval(state.local.g[claim], betaInverse)
+		result[2*claim] = state.local.gAtBeta[claim]
+		result[2*claim+1] = state.local.gAtBetaInverse[claim]
+	}
+	localPolynomials := [3][]fr.Element{state.local.h, state.local.t0, state.local.t1}
+	for polynomial := range localPolynomials {
+		state.local.lAtBeta[polynomial] = cryptodlinkzg.Eval(localPolynomials[polynomial], beta)
+		state.local.lAtBetaInverse[polynomial] = cryptodlinkzg.Eval(localPolynomials[polynomial], betaInverse)
 	}
 	state.localSAtBeta = cryptodlinkzg.Eval(state.local.laurent, beta)
 	result[6] = state.localSAtBeta
@@ -1320,8 +1327,8 @@ func compiledMPIOpeningU3Share(
 			Polynomial: state.local.g[claim],
 			ClaimedValues: []fr.Element{
 				atZ,
-				cryptodlinkzg.Eval(state.local.g[claim], beta),
-				cryptodlinkzg.Eval(state.local.g[claim], betaInverse),
+				state.local.gAtBeta[claim],
+				state.local.gAtBetaInverse[claim],
 			},
 		}
 	}
@@ -1336,13 +1343,10 @@ func compiledMPIOpeningU3Share(
 	lPolynomials := [4][]fr.Element{state.local.h, state.local.t0, state.local.t1, state.local.laurent}
 	lInputs := make([]cryptodlinkzg.SameSetInput, len(lPolynomials))
 	for polynomial := range lPolynomials {
-		values := []fr.Element{
-			cryptodlinkzg.Eval(lPolynomials[polynomial], beta),
-			cryptodlinkzg.Eval(lPolynomials[polynomial], betaInverse),
-		}
-		if polynomial == 3 {
-			values[0] = state.localSAtBeta
-			values[1] = state.localSAtBetaInverse
+		values := []fr.Element{state.localSAtBeta, state.localSAtBetaInverse}
+		if polynomial < len(state.local.lAtBeta) {
+			values[0] = state.local.lAtBeta[polynomial]
+			values[1] = state.local.lAtBetaInverse[polynomial]
 		}
 		lInputs[polynomial] = cryptodlinkzg.SameSetInput{Polynomial: lPolynomials[polynomial], ClaimedValues: values}
 	}

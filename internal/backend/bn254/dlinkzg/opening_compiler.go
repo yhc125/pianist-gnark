@@ -170,15 +170,19 @@ type dlinkzgOpeningPrepared struct {
 }
 
 type dlinkzgOpeningLocalState struct {
-	shifted [dlinkzgOpeningCircuitClaims][]fr.Element
-	g       [dlinkzgOpeningCircuitClaims][]fr.Element
-	d       [dlinkzgOpeningCircuitClaims]fr.Element
-	dLink   fr.Element
-	h       []fr.Element
-	t0      []fr.Element
-	t1      []fr.Element
-	laurent []fr.Element
-	input   cryptodlinkzg.LocalLaurentInput
+	shifted        [dlinkzgOpeningCircuitClaims][]fr.Element
+	g              [dlinkzgOpeningCircuitClaims][]fr.Element
+	gAtBeta        [dlinkzgOpeningCircuitClaims]fr.Element
+	gAtBetaInverse [dlinkzgOpeningCircuitClaims]fr.Element
+	d              [dlinkzgOpeningCircuitClaims]fr.Element
+	dLink          fr.Element
+	h              []fr.Element
+	t0             []fr.Element
+	t1             []fr.Element
+	lAtBeta        [3]fr.Element
+	lAtBetaInverse [3]fr.Element
+	laurent        []fr.Element
+	input          cryptodlinkzg.LocalLaurentInput
 }
 
 func proveDLinkZGOpeningWithTranscript(instance DLinkZGOpeningInstance, input DLinkZGOpeningProverInput, transcriptFactory dlinkzgOpeningTranscriptFactory) (DLinkZGOpeningProof, error) {
@@ -312,17 +316,17 @@ func proveDLinkZGOpeningWithTranscript(instance DLinkZGOpeningInstance, input DL
 	localSAtBetaInverse := make([]fr.Element, prepared.m)
 	for rank := 0; rank < prepared.m; rank++ {
 		for claim := 0; claim < dlinkzgOpeningCircuitClaims; claim++ {
-			atBeta := cryptodlinkzg.Eval(locals[rank].g[claim], beta)
-			atBetaInverse := cryptodlinkzg.Eval(locals[rank].g[claim], betaInverse)
-			proof.U2.PartialAtBeta[claim].Add(&proof.U2.PartialAtBeta[claim], &atBeta)
-			proof.U2.PartialAtBetaInverse[claim].Add(&proof.U2.PartialAtBetaInverse[claim], &atBetaInverse)
+			locals[rank].gAtBeta[claim] = cryptodlinkzg.Eval(locals[rank].g[claim], beta)
+			locals[rank].gAtBetaInverse[claim] = cryptodlinkzg.Eval(locals[rank].g[claim], betaInverse)
+			proof.U2.PartialAtBeta[claim].Add(&proof.U2.PartialAtBeta[claim], &locals[rank].gAtBeta[claim])
+			proof.U2.PartialAtBetaInverse[claim].Add(&proof.U2.PartialAtBetaInverse[claim], &locals[rank].gAtBetaInverse[claim])
 		}
 		localPolynomials := [3][]fr.Element{locals[rank].h, locals[rank].t0, locals[rank].t1}
 		for polynomial := range localPolynomials {
-			atBeta := cryptodlinkzg.Eval(localPolynomials[polynomial], beta)
-			atBetaInverse := cryptodlinkzg.Eval(localPolynomials[polynomial], betaInverse)
-			proof.U2.BatchAtBeta[polynomial].Add(&proof.U2.BatchAtBeta[polynomial], &atBeta)
-			proof.U2.BatchAtBetaInverse[polynomial].Add(&proof.U2.BatchAtBetaInverse[polynomial], &atBetaInverse)
+			locals[rank].lAtBeta[polynomial] = cryptodlinkzg.Eval(localPolynomials[polynomial], beta)
+			locals[rank].lAtBetaInverse[polynomial] = cryptodlinkzg.Eval(localPolynomials[polynomial], betaInverse)
+			proof.U2.BatchAtBeta[polynomial].Add(&proof.U2.BatchAtBeta[polynomial], &locals[rank].lAtBeta[polynomial])
+			proof.U2.BatchAtBetaInverse[polynomial].Add(&proof.U2.BatchAtBetaInverse[polynomial], &locals[rank].lAtBetaInverse[polynomial])
 		}
 		localSAtBeta[rank] = cryptodlinkzg.Eval(locals[rank].laurent, beta)
 		proof.U2.BatchAtBeta[3].Add(&proof.U2.BatchAtBeta[3], &localSAtBeta[rank])
@@ -389,8 +393,8 @@ func proveDLinkZGOpeningWithTranscript(instance DLinkZGOpeningInstance, input DL
 				Polynomial: locals[rank].g[claim],
 				ClaimedValues: []fr.Element{
 					atZ,
-					cryptodlinkzg.Eval(locals[rank].g[claim], beta),
-					cryptodlinkzg.Eval(locals[rank].g[claim], betaInverse),
+					locals[rank].gAtBeta[claim],
+					locals[rank].gAtBetaInverse[claim],
 				},
 			}
 		}
@@ -407,13 +411,10 @@ func proveDLinkZGOpeningWithTranscript(instance DLinkZGOpeningInstance, input DL
 		lPolynomials := [4][]fr.Element{locals[rank].h, locals[rank].t0, locals[rank].t1, locals[rank].laurent}
 		lInputs := make([]cryptodlinkzg.SameSetInput, len(lPolynomials))
 		for polynomial := range lPolynomials {
-			values := []fr.Element{
-				cryptodlinkzg.Eval(lPolynomials[polynomial], beta),
-				cryptodlinkzg.Eval(lPolynomials[polynomial], betaInverse),
-			}
-			if polynomial == 3 {
-				values[0] = localSAtBeta[rank]
-				values[1] = localSAtBetaInverse[rank]
+			values := []fr.Element{localSAtBeta[rank], localSAtBetaInverse[rank]}
+			if polynomial < len(locals[rank].lAtBeta) {
+				values[0] = locals[rank].lAtBeta[polynomial]
+				values[1] = locals[rank].lAtBetaInverse[polynomial]
 			}
 			lInputs[polynomial] = cryptodlinkzg.SameSetInput{Polynomial: lPolynomials[polynomial], ClaimedValues: values}
 		}
