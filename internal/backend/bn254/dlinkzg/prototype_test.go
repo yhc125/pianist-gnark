@@ -106,7 +106,7 @@ func TestCorrectnessPrototypeRejectsTampering(t *testing.T) {
 	}
 
 	tamperedQuotient := proof
-	tamperedQuotient.WG = statement.SourceCommitments[0]
+	tamperedQuotient.WN = statement.SourceCommitments[0]
 	if err := Verify(statement, tamperedQuotient, challenges, srs); !errors.Is(err, ErrPrototypeOpening) {
 		t.Fatalf("tampered quotient commitment: got %v, want ErrPrototypeOpening", err)
 	}

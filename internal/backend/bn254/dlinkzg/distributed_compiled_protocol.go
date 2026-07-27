@@ -1,9 +1,9 @@
 package dlinkzg
 
-// This file is the role-local M+1 execution of the compiled protocol. MPI
-// rank zero owns only CompiledCoordinatorSetup; rank r in [1,M] owns exactly
-// party slot r-1. Every rank has the public verifier key and replays both
-// Fiat--Shamir transcripts locally. Only rank zero returns a proof.
+// This file is the role-local M-rank execution of the compiled protocol. MPI
+// rank zero owns party slot zero and CompiledCoordinatorSetup; rank r in
+// [1,M) owns party slot r. Every rank has the public verifier key and replays
+// both Fiat--Shamir transcripts locally. Only rank zero returns a proof.
 
 import (
 	"errors"
@@ -25,8 +25,8 @@ var (
 	ErrCompiledMPIProtocol = errors.New("dlinkzg: compiled MPI protocol failed")
 )
 
-// CompiledMPIRole is exclusive. Rank zero sets Coordinator only; every other
-// rank sets Party only. It intentionally cannot contain a complete setup.
+// CompiledMPIRole is rank-local. Every rank sets Party; rank zero additionally
+// sets Coordinator. It intentionally cannot contain a complete setup.
 type CompiledMPIRole struct {
 	Party       *CompiledPartySetup
 	Coordinator *CompiledCoordinatorSetup
@@ -46,9 +46,9 @@ type CompiledMPIProver struct {
 }
 
 // CompiledMPIPhaseTiming separates elapsed phase time from time spent inside
-// transport collectives. On the coordinator, Active is therefore an
-// approximation of root-side computation/serialization and Transport
-// includes network service plus waiting for workers.
+// transport collectives. On composite rank zero, Active is therefore an
+// approximation of P_0 work plus coordinator computation/serialization, and
+// Transport includes network service plus waiting for the other workers.
 type CompiledMPIPhaseTiming struct {
 	Total     time.Duration
 	Transport time.Duration
@@ -107,7 +107,7 @@ func finishCompiledMPITransportProfile(
 }
 
 // compiledMPITrace is test/diagnostic state, never a proof field. It lets the
-// fake-network suite assert that all M+1 ranks replayed identical transcripts.
+// fake-network suite asserts that all M ranks replay identical transcripts.
 type compiledMPITrace struct {
 	Outer   TranscriptDigest
 	Opening TranscriptDigest
@@ -125,6 +125,8 @@ type compiledMPIOuterSuffix struct {
 
 type compiledMPIOpeningPartyState struct {
 	local               dlinkzgOpeningLocalState
+	localCircuitClaims  [dlinkzgOpeningCircuitClaims]fr.Element
+	localTarget         fr.Element
 	localSAtBeta        fr.Element
 	localSAtBetaInverse fr.Element
 }
@@ -140,10 +142,10 @@ func ProvisionCompiledMPIRole(
 	if err := setup.ValidateOnlineRoles(); err != nil {
 		return CompiledVerifyingKey{}, CompiledMPIRole{}, err
 	}
-	if mpiRank > uint64(setup.Metadata.PartitionCount) {
+	if mpiRank >= uint64(setup.Metadata.PartitionCount) {
 		return CompiledVerifyingKey{}, CompiledMPIRole{}, fmt.Errorf(
-			"%w: MPI rank %d exceeds coordinator-plus-parties world M+1=%d",
-			ErrInvalidCompiledMPIRole, mpiRank, setup.Metadata.PartitionCount+1,
+			"%w: MPI rank %d exceeds M-rank party world=%d",
+			ErrInvalidCompiledMPIRole, mpiRank, setup.Metadata.PartitionCount,
 		)
 	}
 	vk, err := setup.VerifyingKey()
@@ -152,9 +154,12 @@ func ProvisionCompiledMPIRole(
 	}
 	if mpiRank == 0 {
 		coordinator := setup.Coordinator
-		return vk, CompiledMPIRole{Coordinator: &coordinator}, nil
+		setup.Parties[0].FastFixed.preprocessExtendedSelectors()
+		party := setup.Parties[0]
+		return vk, CompiledMPIRole{Party: &party, Coordinator: &coordinator}, nil
 	}
-	party := setup.Parties[mpiRank-1]
+	setup.Parties[mpiRank].FastFixed.preprocessExtendedSelectors()
+	party := setup.Parties[mpiRank]
 	return vk, CompiledMPIRole{Party: &party}, nil
 }
 
@@ -273,7 +278,7 @@ func compiledProveMPIWithTraceValidatedProfiled(
 	// broadcast so every rank samples the same initial challenge batch.
 	phaseStarted := time.Now()
 	w0Share := MPIPayload{}
-	if !isRoot {
+	if role.Party != nil {
 		table, _, buildErr := compiledBuildLocalPIOPTableFromSolution(
 			role.Party.Preprocessing, role.Party.ConstraintSystem, partySolution,
 		)
@@ -345,7 +350,7 @@ func compiledProveMPIWithTraceValidatedProfiled(
 	// W1: the local accumulator is fixed before lambda.
 	phaseStarted = time.Now()
 	w1Share := MPIPayload{}
-	if !isRoot {
+	if role.Party != nil {
 		w1, buildErr := fastState.BuildAccumulator(
 			localChallenges.EtaPart, localChallenges.EtaX, localChallenges.Gamma,
 		)
@@ -402,7 +407,7 @@ func compiledProveMPIWithTraceValidatedProfiled(
 	// W2: three quotient chunks per party.
 	phaseStarted = time.Now()
 	w2Share := MPIPayload{}
-	if !isRoot {
+	if role.Party != nil {
 		relation, err = fastState.BuildQuotient(localChallenges.Lambda)
 		if err != nil {
 			return nil, trace, compiledMPIError("W2 arithmetic", err)
@@ -461,7 +466,7 @@ func compiledProveMPIWithTraceValidatedProfiled(
 	// party's t0/t1 coefficients, then broadcasts the complete public suffix.
 	phaseStarted = time.Now()
 	w3Share := MPIPayload{}
-	if !isRoot {
+	if role.Party != nil {
 		terminals, terminalErr := relation.TerminalEvaluations(alpha)
 		if terminalErr != nil {
 			return nil, trace, compiledMPIError("W3 terminals", terminalErr)
@@ -515,7 +520,7 @@ func compiledProveMPIWithTraceValidatedProfiled(
 		return nil, trace, compiledMPIError("W3 scatter", err)
 	}
 	var localTreePair ProtocolW3ScatterRecord
-	if !isRoot {
+	if role.Party != nil {
 		localTreePair, err = UnpackProtocolW3Scatter(w3LocalPairPayload)
 		if err != nil {
 			return nil, trace, compiledMPIError("W3 scatter decode", err)
@@ -601,13 +606,15 @@ func compiledProveMPIWithTraceValidatedProfiled(
 		return nil, trace, compiledMPIError("opening instance", err)
 	}
 	var sources [LocalCompressedSourceCount][]fr.Element
-	if !isRoot {
+	var sourceValues [LocalCompressedSourceCount]fr.Element
+	if role.Party != nil {
 		compression, compressionErr := CompressLocalTerminalSources(relation, alpha, mu)
 		if compressionErr != nil {
 			return nil, trace, compiledMPIError("local source compression", compressionErr)
 		}
 		for group := range sources {
 			sources[group] = compression.Polynomials[group]
+			sourceValues[group] = compression.Values[group]
 		}
 	}
 	openingTranscript, err := NewOpeningTranscript(openingInstance.TranscriptContext)
@@ -619,10 +626,10 @@ func compiledProveMPIWithTraceValidatedProfiled(
 	phaseStarted = time.Now()
 	var openingPartyState compiledMPIOpeningPartyState
 	u0Share := MPIPayload{}
-	if !isRoot {
+	if role.Party != nil {
 		var share U0Message
 		openingPartyState, share, err = compiledMPIOpeningU0Share(
-			role.Party, sources, openingInstance, prepared,
+			role.Party, sources, sourceValues, openingInstance, prepared,
 		)
 		if err != nil {
 			return nil, trace, compiledMPIError("U0 local", err)
@@ -682,7 +689,7 @@ func compiledProveMPIWithTraceValidatedProfiled(
 	// reconstructs h_xi coefficients and both public commitments.
 	phaseStarted = time.Now()
 	u1Share := MPIPayload{}
-	if !isRoot {
+	if role.Party != nil {
 		d, laurentCommitment, shareErr := compiledMPIOpeningU1Share(
 			role.Party, &openingPartyState, localTreePair.T0, localTreePair.T1,
 			prepared, xi, nu, zChallenge,
@@ -762,8 +769,10 @@ func compiledProveMPIWithTraceValidatedProfiled(
 	// evaluates h_xi,t0,t1 itself and derives the canonical S(beta^-1).
 	phaseStarted = time.Now()
 	u2Share := MPIPayload{}
-	if !isRoot {
-		shareValues, shareErr := compiledMPIOpeningU2Share(&openingPartyState, beta)
+	if role.Party != nil {
+		shareValues, shareErr := compiledMPIOpeningU2Share(
+			&openingPartyState, prepared, xi, nu, beta,
+		)
 		if shareErr != nil {
 			return nil, trace, compiledMPIError("U2 local", shareErr)
 		}
@@ -845,10 +854,10 @@ func compiledProveMPIWithTraceValidatedProfiled(
 	}
 	profile.recordTotal(ProtocolMPIPhaseU2, time.Since(phaseStarted))
 
-	// U3: parties aggregate WG,WL,PiZ; PiY is coordinator-only.
+	// U3: parties aggregate WN,PiZ; PiY is coordinator-only.
 	phaseStarted = time.Now()
 	u3Share := MPIPayload{}
-	if !isRoot {
+	if role.Party != nil {
 		shares, shareErr := compiledMPIOpeningU3Share(
 			role.Party, &openingPartyState, prepared, xi, zChallenge, beta, kappa,
 		)
@@ -856,7 +865,7 @@ func compiledProveMPIWithTraceValidatedProfiled(
 			return nil, trace, compiledMPIError("U3 local", shareErr)
 		}
 		u3Share, err = PackProtocolU3Aggregate(ProtocolU3AggregateRecord{
-			WG: shares[0], WL: shares[1], PiZ: shares[2],
+			WN: shares[0], PiZ: shares[1],
 		})
 		if err != nil {
 			return nil, trace, compiledMPIError("U3 aggregate payload", err)
@@ -875,7 +884,7 @@ func compiledProveMPIWithTraceValidatedProfiled(
 		if decodeErr != nil {
 			return nil, trace, compiledMPIError("U3 aggregate decode", decodeErr)
 		}
-		message := U3Message{WG: record.WG, WL: record.WL, PiZ: record.PiZ}
+		message := U3Message{WN: record.WN, PiZ: record.PiZ}
 		qY, sourceValue := cryptodlinkzg.SyntheticDivision(hCoefficients, beta)
 		if !sourceValue.Equal(&publicProof.U2.BatchAtBeta[0]) {
 			return nil, trace, compiledMPIError("U3 source-link value", ErrDLinkZGOpeningRejected)
@@ -946,9 +955,16 @@ func validateCompiledMPIStaticRole(
 	if uint64(vk.Metadata.PartitionCount) != channel.PartitionCount() {
 		return fmt.Errorf("%w: VK M=%d, channel M=%d", ErrInvalidCompiledMPIRole, vk.Metadata.PartitionCount, channel.PartitionCount())
 	}
+	slot, ok := channel.PartySlot()
+	if !ok || slot > uint64(^uint(0)>>1) {
+		return fmt.Errorf("%w: invalid party slot", ErrInvalidCompiledMPIRole)
+	}
+	if role.Party == nil {
+		return fmt.Errorf("%w: rank %d has no party role", ErrInvalidCompiledMPIRole, channel.Rank())
+	}
 	if channel.IsCoordinator() {
-		if role.Coordinator == nil || role.Party != nil {
-			return fmt.Errorf("%w: rank zero must own only the coordinator role", ErrInvalidCompiledMPIRole)
+		if role.Coordinator == nil {
+			return fmt.Errorf("%w: rank zero must own coordinator and party roles", ErrInvalidCompiledMPIRole)
 		}
 		coordinator := role.Coordinator
 		if coordinator.Metadata != vk.Metadata || coordinator.SRS == nil ||
@@ -958,15 +974,8 @@ func validateCompiledMPIStaticRole(
 			!compiledAggregateFixedEqual(coordinator.FixedCommitments, vk.Verifier.FixedCommitments) {
 			return fmt.Errorf("%w: coordinator role is not bound to the common VK", ErrInvalidCompiledMPIRole)
 		}
-		return nil
-	}
-
-	if role.Party == nil || role.Coordinator != nil {
-		return fmt.Errorf("%w: party rank must own exactly one party role", ErrInvalidCompiledMPIRole)
-	}
-	slot, ok := channel.PartySlot()
-	if !ok || slot > uint64(^uint(0)>>1) {
-		return fmt.Errorf("%w: invalid party slot", ErrInvalidCompiledMPIRole)
+	} else if role.Coordinator != nil {
+		return fmt.Errorf("%w: non-root party rank owns coordinator role", ErrInvalidCompiledMPIRole)
 	}
 	party := role.Party
 	if party.Rank != int(slot) || party.Metadata != vk.Metadata ||
@@ -1008,14 +1017,8 @@ func validateCompiledMPIDynamicInput(
 	if err := validateCompiledStatement(vk.Metadata, vk.Verifier.PublicInputPlacement, statement); err != nil {
 		return err
 	}
-	if role.Coordinator != nil {
-		if role.Party != nil || len(partySolution) != 0 {
-			return fmt.Errorf("%w: rank zero must own no party role or solution", ErrInvalidCompiledMPIRole)
-		}
-		return nil
-	}
-	if role.Party == nil || role.Coordinator != nil {
-		return fmt.Errorf("%w: party rank must own exactly one party role", ErrInvalidCompiledMPIRole)
+	if role.Party == nil {
+		return fmt.Errorf("%w: rank has no party role", ErrInvalidCompiledMPIRole)
 	}
 	party := role.Party
 	layout := party.Preprocessing.layout
@@ -1209,15 +1212,13 @@ func compiledMPIPrepareOpening(instance DLinkZGOpeningInstance) (dlinkzgOpeningP
 	}
 	prepared.weights = cryptodlinkzg.EqualityWeights(instance.PartitionPoint)
 	prepared.psiR = append([]fr.Element(nil), prepared.weights...)
-	for claim := range prepared.psiQ {
-		prepared.psiQ[claim] = cryptodlinkzg.EqualityWeights(prepared.queries[claim])
-	}
 	return prepared, nil
 }
 
 func compiledMPIOpeningU0Share(
 	party *CompiledPartySetup,
 	sources [LocalCompressedSourceCount][]fr.Element,
+	sourceValues [LocalCompressedSourceCount]fr.Element,
 	instance DLinkZGOpeningInstance,
 	prepared dlinkzgOpeningPrepared,
 ) (compiledMPIOpeningPartyState, U0Message, error) {
@@ -1231,10 +1232,14 @@ func compiledMPIOpeningU0Share(
 		}
 		sourceBatch[claim] = sources[claim]
 	}
-	shiftedBatch := cryptodlinkzg.FastTaylorShiftBatch(sourceBatch, instance.Shift)
+	shiftedBatch := cryptodlinkzg.FastTaylorShiftBatchWithPrecomputation(
+		sourceBatch,
+		party.FastTaylorShift,
+	)
 	for claim := 0; claim < dlinkzgOpeningCircuitClaims; claim++ {
 		state.local.shifted[claim] = shiftedBatch[claim]
 		state.local.g[claim] = dlinkzgOpeningScalePolynomial(state.local.shifted[claim], prepared.weights[rank])
+		state.localCircuitClaims[claim].Mul(&prepared.weights[rank], &sourceValues[claim])
 		commitment, err := party.RowSRS.CommitZ(state.local.g[claim])
 		if err != nil {
 			return compiledMPIOpeningPartyState{}, U0Message{}, err
@@ -1252,7 +1257,9 @@ func compiledMPIOpeningU1Share(
 	xi, nu, zChallenge fr.Element,
 ) ([dlinkzgOpeningCircuitClaims]fr.Element, bn254.G1Affine, error) {
 	var d [dlinkzgOpeningCircuitClaims]fr.Element
-	aWeights, bWeights := treeWeightPolynomials(prepared.tree, xi, prepared.t)
+	// The tree weights have only M coefficients. Padding them to T used to
+	// allocate and scan two mostly-zero vectors on every worker.
+	aWeights, bWeights := treeWeightPolynomials(prepared.tree, xi, prepared.m)
 	xiPower := fr.One()
 	for claim := 0; claim < dlinkzgOpeningCircuitClaims; claim++ {
 		state.local.d[claim] = cryptodlinkzg.Eval(state.local.shifted[claim], zChallenge)
@@ -1266,11 +1273,26 @@ func compiledMPIOpeningU1Share(
 	state.local.t0 = dlinkzgOpeningMonomial(t0, party.Rank)
 	state.local.t1 = dlinkzgOpeningMonomial(t1, party.Rank)
 	state.local.input = cryptodlinkzg.LocalLaurentInput{
-		G: state.local.g, PsiQ: prepared.psiQ, P: prepared.scales, Xi: xi,
+		G: state.local.g, P: prepared.scales, Xi: xi,
 		HXi: state.local.h, PsiR: prepared.psiR, Nu: nu,
 		T0: state.local.t0, T1: state.local.t1, AXi: aWeights, BXi: bWeights,
 	}
-	state.local.laurent = cryptodlinkzg.BuildLocalLaurent(state.local.input)
+	state.local.laurent = cryptodlinkzg.BuildLocalLaurentWithTranslatedCircuitQueries(
+		state.local.input,
+		prepared.circuitRatios,
+		party.FastFixed.convolutionDomain,
+	)
+	state.localTarget = compiledMPILocalLaurentTarget(
+		state.localCircuitClaims,
+		state.local.dLink,
+		prepared.weights[party.Rank],
+		t0,
+		t1,
+		aWeights[party.Rank],
+		bWeights[party.Rank],
+		xi,
+		nu,
+	)
 	commitment, err := party.RowSRS.CommitZ(state.local.laurent)
 	if err != nil {
 		return d, bn254.G1Affine{}, err
@@ -1280,34 +1302,62 @@ func compiledMPIOpeningU1Share(
 
 func compiledMPIOpeningU2Share(
 	state *compiledMPIOpeningPartyState,
+	prepared dlinkzgOpeningPrepared,
+	xi, nu,
 	beta fr.Element,
 ) ([7]fr.Element, error) {
 	var result [7]fr.Element
+	var localU2 U2Message
 	betaInverse := dlinkzgOpeningInverse(beta)
 	for claim := 0; claim < dlinkzgOpeningCircuitClaims; claim++ {
 		state.local.gAtBeta[claim] = cryptodlinkzg.Eval(state.local.g[claim], beta)
 		state.local.gAtBetaInverse[claim] = cryptodlinkzg.Eval(state.local.g[claim], betaInverse)
 		result[2*claim] = state.local.gAtBeta[claim]
 		result[2*claim+1] = state.local.gAtBetaInverse[claim]
+		localU2.PartialAtBeta[claim] = state.local.gAtBeta[claim]
+		localU2.PartialAtBetaInverse[claim] = state.local.gAtBetaInverse[claim]
 	}
 	localPolynomials := [3][]fr.Element{state.local.h, state.local.t0, state.local.t1}
 	for polynomial := range localPolynomials {
 		state.local.lAtBeta[polynomial] = cryptodlinkzg.Eval(localPolynomials[polynomial], beta)
 		state.local.lAtBetaInverse[polynomial] = cryptodlinkzg.Eval(localPolynomials[polynomial], betaInverse)
+		localU2.BatchAtBeta[polynomial] = state.local.lAtBeta[polynomial]
+		localU2.BatchAtBetaInverse[polynomial] = state.local.lAtBetaInverse[polynomial]
 	}
 	state.localSAtBeta = cryptodlinkzg.Eval(state.local.laurent, beta)
 	result[6] = state.localSAtBeta
-	localLeft, err := cryptodlinkzg.EvalLocalLaurentLeft(state.local.input, beta)
-	if err != nil {
-		return result, err
-	}
-	state.localSAtBetaInverse, err = cryptodlinkzg.DeriveLaurentInverseValue(
+	// Reuse the six g_j evaluations above and evaluate the public query
+	// polynomials in product form. The former path repeated twelve dense Horner
+	// scans here (six g_j and six length-T PsiQ evaluations).
+	localLeft := dlinkzgOpeningLaurentLeft(localU2, prepared, xi, nu, beta)
+	localSAtBetaInverse, err := cryptodlinkzg.DeriveLaurentInverseValue(
 		beta,
 		localLeft,
-		cryptodlinkzg.LocalLaurentDiagonal(state.local.input),
+		state.localTarget,
 		state.localSAtBeta,
 	)
+	state.localSAtBetaInverse = localSAtBetaInverse
 	return result, err
+}
+
+func compiledMPILocalLaurentTarget(
+	circuitClaims [dlinkzgOpeningCircuitClaims]fr.Element,
+	dLink, partitionWeight, t0, t1, aWeight, bWeight, xi, nu fr.Element,
+) fr.Element {
+	var target, term fr.Element
+	xiPower := fr.One()
+	for claim := range circuitClaims {
+		term.Mul(&xiPower, &circuitClaims[claim])
+		target.Add(&target, &term)
+		xiPower.Mul(&xiPower, &xi)
+	}
+	term.Mul(&dLink, &partitionWeight).Mul(&term, &nu)
+	target.Add(&target, &term)
+	term.Mul(&t0, &aWeight)
+	target.Add(&target, &term)
+	term.Mul(&t1, &bWeight)
+	target.Add(&target, &term)
+	return target
 }
 
 func compiledMPIOpeningU3Share(
@@ -1315,8 +1365,8 @@ func compiledMPIOpeningU3Share(
 	state *compiledMPIOpeningPartyState,
 	prepared dlinkzgOpeningPrepared,
 	xi, zChallenge, beta, kappa fr.Element,
-) ([3]bn254.G1Affine, error) {
-	var result [3]bn254.G1Affine
+) ([2]bn254.G1Affine, error) {
+	var result [2]bn254.G1Affine
 	betaInverse := dlinkzgOpeningInverse(beta)
 	gPoints := []fr.Element{zChallenge, beta, betaInverse}
 	gInputs := make([]cryptodlinkzg.SameSetInput, dlinkzgOpeningCircuitClaims)
@@ -1332,14 +1382,6 @@ func compiledMPIOpeningU3Share(
 			},
 		}
 	}
-	gBatch, err := cryptodlinkzg.BuildSameSetQuotient(gInputs, gPoints, kappa)
-	if err != nil {
-		return result, err
-	}
-	result[0], err = party.RowSRS.CommitZ(gBatch.Quotient)
-	if err != nil {
-		return [3]bn254.G1Affine{}, err
-	}
 	lPolynomials := [4][]fr.Element{state.local.h, state.local.t0, state.local.t1, state.local.laurent}
 	lInputs := make([]cryptodlinkzg.SameSetInput, len(lPolynomials))
 	for polynomial := range lPolynomials {
@@ -1350,13 +1392,15 @@ func compiledMPIOpeningU3Share(
 		}
 		lInputs[polynomial] = cryptodlinkzg.SameSetInput{Polynomial: lPolynomials[polynomial], ClaimedValues: values}
 	}
-	lBatch, err := cryptodlinkzg.BuildSameSetQuotient(lInputs, []fr.Element{beta, betaInverse}, kappa)
+	nestedBatch, err := cryptodlinkzg.BuildNestedSetQuotient(
+		gInputs, gPoints, lInputs, []fr.Element{beta, betaInverse}, kappa,
+	)
 	if err != nil {
-		return [3]bn254.G1Affine{}, err
+		return [2]bn254.G1Affine{}, err
 	}
-	result[1], err = party.RowSRS.CommitZ(lBatch.Quotient)
+	result[0], err = party.RowSRS.CommitZ(nestedBatch.Quotient)
 	if err != nil {
-		return [3]bn254.G1Affine{}, err
+		return [2]bn254.G1Affine{}, err
 	}
 	pXi := make([]fr.Element, prepared.t)
 	xiPower := fr.One()
@@ -1366,9 +1410,9 @@ func compiledMPIOpeningU3Share(
 	}
 	qZ, remainder := cryptodlinkzg.SyntheticDivision(pXi, zChallenge)
 	if !remainder.Equal(&state.local.dLink) {
-		return [3]bn254.G1Affine{}, fmt.Errorf("%w: local source-link remainder", ErrCompiledMPIProtocol)
+		return [2]bn254.G1Affine{}, fmt.Errorf("%w: local source-link remainder", ErrCompiledMPIProtocol)
 	}
-	result[2], err = party.RowSRS.CommitRow(qZ)
+	result[1], err = party.RowSRS.CommitRow(qZ)
 	return result, err
 }
 

@@ -14,7 +14,7 @@ import (
 
 func TestProtocolMPIChannelTopology(t *testing.T) {
 	for _, partitions := range []uint64{2, 4} {
-		worldSize := partitions + 1
+		worldSize := partitions
 		network := newFakeMPINetwork(worldSize)
 		for rank := uint64(0); rank < worldSize; rank++ {
 			channel, err := newProtocolMPIChannel(network.transport(rank))
@@ -26,14 +26,11 @@ func TestProtocolMPIChannelTopology(t *testing.T) {
 				t.Fatalf("M=%d rank=%d: wrong topology", partitions, rank)
 			}
 			slot, party := channel.PartySlot()
-			if rank == 0 {
-				if !channel.IsCoordinator() || party {
-					t.Fatalf("rank zero is not coordinator-only")
-				}
-			} else {
-				if channel.IsCoordinator() || !party || slot != rank-1 {
-					t.Fatalf("rank %d maps to slot %d, party=%t", rank, slot, party)
-				}
+			if !party || slot != rank {
+				t.Fatalf("rank %d maps to slot %d, party=%t", rank, slot, party)
+			}
+			if channel.IsCoordinator() != (rank == 0) {
+				t.Fatalf("rank %d coordinator=%t", rank, channel.IsCoordinator())
 			}
 		}
 	}
@@ -46,10 +43,10 @@ func TestProtocolMPIChannelRejectsInvalidTopology(t *testing.T) {
 	}{
 		{rank: 0, size: 0},
 		{rank: 0, size: 1},
-		{rank: 0, size: 2}, // M=1 is below the protocol minimum.
-		{rank: 0, size: 4}, // M=3 is not a power of two.
-		{rank: 0, size: 6}, // M=5 is not a power of two.
-		{rank: 3, size: 3},
+		{rank: 0, size: 3},
+		{rank: 0, size: 5},
+		{rank: 0, size: 6},
+		{rank: 4, size: 4},
 	}
 	for _, test := range tests {
 		transport := &protocolStaticTransport{rank: test.rank, size: test.size}
@@ -82,8 +79,8 @@ func TestProtocolMPIShapeLedger(t *testing.T) {
 		{ProtocolMPIPhaseU1, protocolMPIOpBroadcast, MPIPayloadShape{Fields: 3, G1: 2}},
 		{ProtocolMPIPhaseU2, protocolMPIOpAggregate, MPIPayloadShape{Fields: 7}},
 		{ProtocolMPIPhaseU2, protocolMPIOpBroadcast, MPIPayloadShape{Fields: 14}},
-		{ProtocolMPIPhaseU3, protocolMPIOpAggregate, MPIPayloadShape{G1: 3}},
-		{ProtocolMPIPhaseU3, protocolMPIOpBroadcast, MPIPayloadShape{G1: 4}},
+		{ProtocolMPIPhaseU3, protocolMPIOpAggregate, MPIPayloadShape{G1: 2}},
+		{ProtocolMPIPhaseU3, protocolMPIOpBroadcast, MPIPayloadShape{G1: 3}},
 	}
 	for _, partitions := range []uint64{2, 4} {
 		for _, entry := range base {
@@ -134,7 +131,7 @@ type protocolFullResult struct {
 
 func runProtocolMPIFullSchedule(t *testing.T, partitions uint64) {
 	t.Helper()
-	worldSize := partitions + 1
+	worldSize := partitions
 	network := newFakeMPINetwork(worldSize)
 	channels := make([]*ProtocolMPIChannel, worldSize)
 	for rank := uint64(0); rank < worldSize; rank++ {
@@ -145,9 +142,6 @@ func runProtocolMPIFullSchedule(t *testing.T, partitions uint64) {
 		channels[rank] = channel
 	}
 
-	// Rank two completes its W3 send before rank one is released. This makes
-	// arrival order differ from canonical slot order without using sleeps.
-	rankTwoGathered := make(chan struct{})
 	results := make([]protocolFullResult, worldSize)
 	var wait sync.WaitGroup
 	for rank := uint64(0); rank < worldSize; rank++ {
@@ -173,19 +167,8 @@ func runProtocolMPIFullSchedule(t *testing.T, partitions uint64) {
 			w3GatherShape, _ := protocolMPIExpectedShape(
 				ProtocolMPIPhaseW3, protocolMPIOpGather, partitions,
 			)
-			w3Local := MPIPayload{}
-			if rank != 0 {
-				w3Local = protocolPayloadWithScalar(w3GatherShape, 1000+rank)
-			}
-			if rank == 1 {
-				<-rankTwoGathered
-			}
+			w3Local := protocolPayloadWithScalar(w3GatherShape, 1000+rank)
 			gathered, err := channel.GatherWorkers(ProtocolMPIPhaseW3, w3GatherShape, w3Local)
-			if rank == 2 {
-				// Release rank one even when rank two observes an error, so a
-				// failing test cannot strand another goroutine at the gate.
-				close(rankTwoGathered)
-			}
 			if err != nil {
 				results[rank].err = fmt.Errorf("W3 gather: %w", err)
 				return
@@ -237,10 +220,7 @@ func runProtocolMPIFullSchedule(t *testing.T, partitions uint64) {
 			u1GatherShape, _ := protocolMPIExpectedShape(
 				ProtocolMPIPhaseU1, protocolMPIOpGather, partitions,
 			)
-			u1Local := MPIPayload{}
-			if rank != 0 {
-				u1Local = protocolPayloadWithScalar(u1GatherShape, 4000+rank)
-			}
+			u1Local := protocolPayloadWithScalar(u1GatherShape, 4000+rank)
 			u1Gather, err := channel.GatherWorkers(ProtocolMPIPhaseU1, u1GatherShape, u1Local)
 			if err != nil {
 				results[rank].err = fmt.Errorf("U1 gather: %w", err)
@@ -281,12 +261,8 @@ func runProtocolMPIFullSchedule(t *testing.T, partitions uint64) {
 		if results[rank].err != nil {
 			t.Fatalf("rank %d: %v", rank, results[rank].err)
 		}
-		if rank == 0 {
-			if !results[rank].coordinator || results[rank].isParty {
-				t.Fatalf("root role mismatch")
-			}
-		} else if results[rank].coordinator || !results[rank].isParty ||
-			results[rank].partySlot != rank-1 {
+		if !results[rank].isParty || results[rank].partySlot != rank ||
+			results[rank].coordinator != (rank == 0) {
 			t.Fatalf("rank %d slot mismatch", rank)
 		}
 
@@ -311,18 +287,15 @@ func runProtocolMPIFullSchedule(t *testing.T, partitions uint64) {
 				t.Fatalf("root gather lengths W3=%d U1=%d", len(results[rank].w3Gather), len(results[rank].u1Gather))
 			}
 			for slot := uint64(0); slot < partitions; slot++ {
-				assertProtocolPayloadScalar(t, results[rank].w3Gather[slot], 1000+slot+1)
-				assertProtocolPayloadScalar(t, results[rank].u1Gather[slot], 4000+slot+1)
-			}
-			if !emptyMPIPayload(results[rank].w3Scatter) {
-				t.Fatalf("coordinator received a scatter payload")
+				assertProtocolPayloadScalar(t, results[rank].w3Gather[slot], 1000+slot)
+				assertProtocolPayloadScalar(t, results[rank].u1Gather[slot], 4000+slot)
 			}
 		} else {
 			if results[rank].w3Gather != nil || results[rank].u1Gather != nil {
 				t.Fatalf("party rank %d received gathered records", rank)
 			}
-			assertProtocolPayloadScalar(t, results[rank].w3Scatter, 2000+rank-1)
 		}
+		assertProtocolPayloadScalar(t, results[rank].w3Scatter, 2000+rank)
 
 		wantAccounting := expectedProtocolMPIAccounting(rank, partitions)
 		if !reflect.DeepEqual(results[rank].accounting, wantAccounting) {
@@ -336,7 +309,7 @@ func runProtocolMPIFullSchedule(t *testing.T, partitions uint64) {
 	// Completion is terminal; replaying the last operation is rejected before
 	// any transport action.
 	if _, err := channels[0].RootBroadcast(
-		ProtocolMPIPhaseU3, MPIPayloadShape{G1: 4}, protocolPayloadWithScalar(MPIPayloadShape{G1: 4}, 1),
+		ProtocolMPIPhaseU3, MPIPayloadShape{G1: 3}, protocolPayloadWithScalar(MPIPayloadShape{G1: 3}, 1),
 	); !errors.Is(err, ErrProtocolMPISchedule) {
 		t.Fatalf("post-completion replay: got %v", err)
 	}
@@ -352,10 +325,7 @@ func runProtocolAggregateBroadcast(
 	if err != nil {
 		return err
 	}
-	local := MPIPayload{}
-	if rank != 0 {
-		local = protocolPayloadWithScalar(aggregateShape, protocolWorkerScalar(phase, rank))
-	}
+	local := protocolPayloadWithScalar(aggregateShape, protocolWorkerScalar(phase, rank))
 	aggregate, err := channel.AggregateWorkers(phase, aggregateShape, local)
 	if err != nil {
 		return fmt.Errorf("%s aggregate: %w", phase, err)
@@ -379,7 +349,7 @@ func runProtocolAggregateBroadcast(
 }
 
 func TestProtocolMPIChannelStrictScheduleAndRoles(t *testing.T) {
-	root, err := newProtocolMPIChannel(newFakeMPINetwork(3).transport(0))
+	root, err := newProtocolMPIChannel(newFakeMPINetwork(2).transport(0))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -395,9 +365,9 @@ func TestProtocolMPIChannelStrictScheduleAndRoles(t *testing.T) {
 	if _, err := root.AggregateWorkers(
 		ProtocolMPIPhaseW0,
 		MPIPayloadShape{G1: 3},
-		protocolPayloadWithScalar(MPIPayloadShape{G1: 3}, 9),
+		MPIPayload{},
 	); !errors.Is(err, ErrMPIPayload) {
-		t.Fatalf("coordinator aggregate share: got %v", err)
+		t.Fatalf("missing root worker share: got %v", err)
 	}
 
 	root.phase = ProtocolMPIPhaseW3
@@ -409,7 +379,7 @@ func TestProtocolMPIChannelStrictScheduleAndRoles(t *testing.T) {
 		t.Fatalf("short root scatter: got %v", err)
 	}
 
-	party, err := newProtocolMPIChannel(newFakeMPINetwork(3).transport(1))
+	party, err := newProtocolMPIChannel(newFakeMPINetwork(2).transport(1))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -464,7 +434,7 @@ func TestProtocolMPIChannelRejectsCorruptHeaders(t *testing.T) {
 			mutate(encoded)
 			transport := &protocolScriptTransport{
 				rank: 0,
-				size: 3,
+				size: 2,
 				receives: []protocolScriptReceive{{
 					from:  1,
 					bytes: encoded,
@@ -475,7 +445,7 @@ func TestProtocolMPIChannelRejectsCorruptHeaders(t *testing.T) {
 				t.Fatal(channelErr)
 			}
 			if _, aggregateErr := channel.AggregateWorkers(
-				ProtocolMPIPhaseW0, shape, MPIPayload{},
+				ProtocolMPIPhaseW0, shape, protocolPayloadWithScalar(shape, 1),
 			); !errors.Is(aggregateErr, ErrProtocolMPIRecord) {
 				t.Fatalf("got %v, want protocol record error", aggregateErr)
 			}
@@ -541,7 +511,7 @@ func protocolWorkerScalar(phase ProtocolMPIPhase, rank uint64) uint64 {
 }
 
 func protocolAggregateScalar(phase ProtocolMPIPhase, partitions uint64) uint64 {
-	return partitions*uint64(phase+1)*10 + partitions*(partitions+1)/2
+	return partitions*uint64(phase+1)*10 + partitions*(partitions-1)/2
 }
 
 func protocolBroadcastScalar(phase ProtocolMPIPhase) uint64 {
@@ -551,7 +521,7 @@ func protocolBroadcastScalar(phase ProtocolMPIPhase) uint64 {
 func expectedProtocolMPIAccounting(rank, partitions uint64) ProtocolMPIAccounting {
 	result := ProtocolMPIAccounting{
 		Rank:           rank,
-		WorldSize:      partitions + 1,
+		WorldSize:      partitions,
 		PartitionCount: partitions,
 	}
 	for phase := ProtocolMPIPhaseW0; phase <= ProtocolMPIPhaseU3; phase++ {
@@ -579,7 +549,7 @@ func expectedProtocolMPIAccounting(rank, partitions uint64) ProtocolMPIAccountin
 				}
 				multiplier := uint64(1)
 				if rank == 0 {
-					multiplier = partitions
+					multiplier = partitions - 1
 				}
 				wireBytes := multiplier * (uint64(protocolMPIHeaderSize) + payloadBytes)
 				protocolBytes := multiplier * payloadBytes

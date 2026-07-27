@@ -7,9 +7,11 @@ package dlinkzg
 import (
 	"errors"
 	"fmt"
+	"runtime"
 
 	"github.com/consensys/gnark-crypto/ecc/bn254/fr"
 	"github.com/consensys/gnark-crypto/ecc/bn254/fr/fft"
+	"github.com/consensys/gnark/internal/utils"
 )
 
 const (
@@ -66,9 +68,11 @@ type FastLocalPIOPW1 struct {
 // interpolation happens once here, outside the per-proof arithmetic path.
 // Its fields are private so completed relations cannot mutate future proofs.
 type FastLocalPIOPFixed struct {
-	domainSize int
-	domain     *fft.Domain
-	index      LocalPIOPIndex
+	domainSize        int
+	domain            *fft.Domain
+	extendedDomain    *fft.Domain
+	convolutionDomain *fft.Domain
+	index             LocalPIOPIndex
 
 	selectors [LocalSelectorCount][]fr.Element
 	sigmaX    [LocalWireCount][]fr.Element
@@ -76,8 +80,10 @@ type FastLocalPIOPFixed struct {
 
 	sigmaXEvaluations    [LocalWireCount][]fr.Element
 	sigmaPartEvaluations [LocalWireCount][]fr.Element
+	extendedSelectors    [LocalSelectorCount][]fr.Element
 	lZero                []fr.Element
 	lStar                []fr.Element
+	domainElements       []fr.Element
 }
 
 // FastLocalPIOPState enforces the W0 -> W1 -> W2 Fiat--Shamir order. The
@@ -94,6 +100,14 @@ type FastLocalPIOPState struct {
 // and permutation columns. Wires and PublicInput are deliberately ignored, so
 // one result can be reused for multiple witnesses and public statements.
 func PreprocessFastLocalPIOPFixed(table LocalPIOPTable, index LocalPIOPIndex) (*FastLocalPIOPFixed, error) {
+	return preprocessFastLocalPIOPFixedWithDomains(table, index, nil, nil, nil)
+}
+
+func preprocessFastLocalPIOPFixedWithDomains(
+	table LocalPIOPTable,
+	index LocalPIOPIndex,
+	domain, extendedDomain, convolutionDomain *fft.Domain,
+) (*FastLocalPIOPFixed, error) {
 	tableSize := len(table.Selectors[LocalSelectorM])
 	if err := validateFastLocalPIOPDomainSize(tableSize); err != nil {
 		return nil, err
@@ -105,11 +119,21 @@ func PreprocessFastLocalPIOPFixed(table LocalPIOPTable, index LocalPIOPIndex) (*
 		return nil, err
 	}
 
-	domain := fft.NewDomain(uint64(tableSize))
+	if domain == nil {
+		domain = fft.NewDomain(uint64(tableSize))
+	}
+	if extendedDomain == nil {
+		extendedDomain = fft.NewDomain(uint64(4 * tableSize))
+	}
+	if convolutionDomain == nil {
+		convolutionDomain = fft.NewDomain(uint64(2*tableSize - 1))
+	}
 	fixed := &FastLocalPIOPFixed{
-		domainSize: tableSize,
-		domain:     domain,
-		index:      index,
+		domainSize:        tableSize,
+		domain:            domain,
+		extendedDomain:    extendedDomain,
+		convolutionDomain: convolutionDomain,
+		index:             index,
 	}
 	for wire := 0; wire < LocalWireCount; wire++ {
 		fixed.sigmaX[wire] = interpolateLocalTable(table.SigmaX[wire], domain)
@@ -128,10 +152,12 @@ func PreprocessFastLocalPIOPFixed(table LocalPIOPTable, index LocalPIOPIndex) (*
 	inverseT.Inverse(&tAsField)
 	fixed.lZero = make([]fr.Element, tableSize)
 	fixed.lStar = make([]fr.Element, tableSize)
+	fixed.domainElements = make([]fr.Element, tableSize)
 	power := fr.One()
 	for coefficient := 0; coefficient < tableSize; coefficient++ {
 		fixed.lZero[coefficient] = inverseT
 		fixed.lStar[coefficient].Mul(&inverseT, &power)
+		fixed.domainElements[coefficient] = power
 		power.Mul(&power, &domain.Generator)
 	}
 	return fixed, nil
@@ -231,50 +257,62 @@ func (state *FastLocalPIOPState) BuildAccumulator(etaPart, etaX, gamma fr.Elemen
 	t := state.relation.DomainSize
 	tagEvaluations := [LocalWireCount][]fr.Element{}
 	identityTagEvaluations := [LocalWireCount][]fr.Element{}
-	for wire := 0; wire < LocalWireCount; wire++ {
-		tagEvaluations[wire] = make([]fr.Element, t)
-		identityTagEvaluations[wire] = make([]fr.Element, t)
-	}
-
-	x := fr.One()
-	for row := 0; row < t; row++ {
-		for wire := 0; wire < LocalWireCount; wire++ {
-			tagEvaluations[wire][row] = state.wires[wire][row]
-			var term fr.Element
-			term.Mul(&etaPart, &state.fixed.sigmaPartEvaluations[wire][row])
-			tagEvaluations[wire][row].Add(&tagEvaluations[wire][row], &term)
-			term.Mul(&etaX, &state.fixed.sigmaXEvaluations[wire][row])
-			tagEvaluations[wire][row].Add(&tagEvaluations[wire][row], &term)
-			tagEvaluations[wire][row].Add(&tagEvaluations[wire][row], &gamma)
-
-			identityTagEvaluations[wire][row] = state.wires[wire][row]
-			term.Mul(&etaPart, &state.relation.Index.SlotLabel)
-			identityTagEvaluations[wire][row].Add(&identityTagEvaluations[wire][row], &term)
-			term.Mul(&state.relation.Index.WireCosets[wire], &x).Mul(&term, &etaX)
-			identityTagEvaluations[wire][row].Add(&identityTagEvaluations[wire][row], &term)
-			identityTagEvaluations[wire][row].Add(&identityTagEvaluations[wire][row], &gamma)
-		}
-		x.Mul(&x, &state.relation.Omega)
-	}
-
 	tags := [LocalWireCount][]fr.Element{}
 	identityTags := [LocalWireCount][]fr.Element{}
 	for wire := 0; wire < LocalWireCount; wire++ {
-		tags[wire] = cloneLocalElements(state.relation.Wires[wire])
-		addScaledLocalPolynomial(tags[wire], state.relation.SigmaPart[wire], etaPart)
-		addScaledLocalPolynomial(tags[wire], state.relation.SigmaX[wire], etaX)
-		tags[wire][0].Add(&tags[wire][0], &gamma)
-
-		identityTags[wire] = cloneLocalElements(state.relation.Wires[wire])
-		var constant, linear fr.Element
-		constant.Mul(&etaPart, &state.relation.Index.SlotLabel).Add(&constant, &gamma)
-		identityTags[wire][0].Add(&identityTags[wire][0], &constant)
-		linear.Mul(&etaX, &state.relation.Index.WireCosets[wire])
-		identityTags[wire][1].Add(&identityTags[wire][1], &linear)
+		tagEvaluations[wire] = make([]fr.Element, t)
+		identityTagEvaluations[wire] = make([]fr.Element, t)
+		tags[wire] = make([]fr.Element, t)
+		identityTags[wire] = make([]fr.Element, t)
 	}
 
-	fEvaluations := multiplyLocalEvaluationFamilies(tagEvaluations, t)
-	fPrimeEvaluations := multiplyLocalEvaluationFamilies(identityTagEvaluations, t)
+	var identityConstant fr.Element
+	identityConstant.Mul(&etaPart, &state.relation.Index.SlotLabel).Add(&identityConstant, &gamma)
+	var identityLinear [LocalWireCount]fr.Element
+	for wire := 0; wire < LocalWireCount; wire++ {
+		identityLinear[wire].Mul(&etaX, &state.relation.Index.WireCosets[wire])
+	}
+
+	parallelFastLoop(t, func(start, end int) {
+		for row := start; row < end; row++ {
+			for wire := 0; wire < LocalWireCount; wire++ {
+				var term fr.Element
+
+				tagEvaluations[wire][row] = state.wires[wire][row]
+				term.Mul(&etaPart, &state.fixed.sigmaPartEvaluations[wire][row])
+				tagEvaluations[wire][row].Add(&tagEvaluations[wire][row], &term)
+				term.Mul(&etaX, &state.fixed.sigmaXEvaluations[wire][row])
+				tagEvaluations[wire][row].Add(&tagEvaluations[wire][row], &term)
+				tagEvaluations[wire][row].Add(&tagEvaluations[wire][row], &gamma)
+
+				identityTagEvaluations[wire][row] = state.wires[wire][row]
+				term.Mul(&etaPart, &state.relation.Index.SlotLabel)
+				identityTagEvaluations[wire][row].Add(&identityTagEvaluations[wire][row], &term)
+				term.Mul(&state.relation.Index.WireCosets[wire], &state.fixed.domainElements[row]).Mul(&term, &etaX)
+				identityTagEvaluations[wire][row].Add(&identityTagEvaluations[wire][row], &term)
+				identityTagEvaluations[wire][row].Add(&identityTagEvaluations[wire][row], &gamma)
+
+				tags[wire][row] = state.relation.Wires[wire][row]
+				term.Mul(&etaPart, &state.relation.SigmaPart[wire][row])
+				tags[wire][row].Add(&tags[wire][row], &term)
+				term.Mul(&etaX, &state.relation.SigmaX[wire][row])
+				tags[wire][row].Add(&tags[wire][row], &term)
+				if row == 0 {
+					tags[wire][row].Add(&tags[wire][row], &gamma)
+				}
+
+				identityTags[wire][row] = state.relation.Wires[wire][row]
+				if row == 0 {
+					identityTags[wire][row].Add(&identityTags[wire][row], &identityConstant)
+				} else if row == 1 {
+					identityTags[wire][row].Add(&identityTags[wire][row], &identityLinear[wire])
+				}
+			}
+		}
+	})
+
+	fEvaluations := multiplyFastEvaluationFamilies(tagEvaluations, t)
+	fPrimeEvaluations := multiplyFastEvaluationFamilies(identityTagEvaluations, t)
 	for row := 0; row < t; row++ {
 		if fPrimeEvaluations[row].IsZero() {
 			state.stage = FastLocalPIOPFailed
@@ -350,79 +388,107 @@ func (state *FastLocalPIOPState) fastQuotientNumerator(lambda fr.Element) ([]fr.
 	if err := validateFastLocalPIOPDomainSize(t); err != nil {
 		return nil, err
 	}
-	extendedDomain := fft.NewDomain(uint64(4 * t))
+	extendedDomain := state.fixed.extendedDomain
 
 	// Keep five extended vectors live. After the gate polynomial is formed,
 	// the three wire vectors are reused for f, f', and scratch space.
-	wireA := fastExtendedEvaluations(state.relation.Wires[LocalWireA], extendedDomain)
-	wireB := fastExtendedEvaluations(state.relation.Wires[LocalWireB], extendedDomain)
-	wireC := fastExtendedEvaluations(state.relation.Wires[LocalWireC], extendedDomain)
-	gate := fastExtendedEvaluations(state.relation.Selectors[LocalSelectorM], extendedDomain)
-	for index := range gate {
-		gate[index].Mul(&gate[index], &wireA[index]).Mul(&gate[index], &wireB[index])
-	}
+	wireA := fastExtendedEvaluations(state.relation.Wires[LocalWireA], state.domain, extendedDomain)
+	wireB := fastExtendedEvaluations(state.relation.Wires[LocalWireB], state.domain, extendedDomain)
+	wireC := fastExtendedEvaluations(state.relation.Wires[LocalWireC], state.domain, extendedDomain)
+	gate := state.fastSelectorEvaluations(LocalSelectorM)
+	parallelFastLoop(len(gate), func(start, end int) {
+		for index := start; index < end; index++ {
+			gate[index].Mul(&gate[index], &wireA[index]).Mul(&gate[index], &wireB[index])
+		}
+	})
 
 	scratch := make([]fr.Element, int(extendedDomain.Cardinality))
-	fillFastExtendedEvaluations(scratch, state.relation.Selectors[LocalSelectorL], extendedDomain)
+	state.fillFastSelectorEvaluations(scratch, LocalSelectorL)
 	addFastPointwiseProduct(gate, scratch, wireA)
-	fillFastExtendedEvaluations(scratch, state.relation.Selectors[LocalSelectorR], extendedDomain)
+	state.fillFastSelectorEvaluations(scratch, LocalSelectorR)
 	addFastPointwiseProduct(gate, scratch, wireB)
-	fillFastExtendedEvaluations(scratch, state.relation.Selectors[LocalSelectorO], extendedDomain)
+	state.fillFastSelectorEvaluations(scratch, LocalSelectorO)
 	addFastPointwiseProduct(gate, scratch, wireC)
-	fillFastExtendedEvaluations(scratch, state.relation.Selectors[LocalSelectorC], extendedDomain)
-	addFastPointwise(gate, scratch)
-	fillFastExtendedEvaluations(scratch, state.relation.PublicInput, extendedDomain)
+	fillFastExtendedEvaluationsSum(
+		scratch,
+		state.relation.Selectors[LocalSelectorC],
+		state.relation.PublicInput,
+		extendedDomain,
+	)
 	addFastPointwise(gate, scratch)
 
+	wireEvaluations := [LocalWireCount][]fr.Element{wireA, wireB, wireC}
 	fEvaluations := wireA
 	fPrimeEvaluations := wireB
 	scratch = wireC
-	for index := range fEvaluations {
-		fEvaluations[index].SetOne()
-		fPrimeEvaluations[index].SetOne()
-	}
+	var identityConstant fr.Element
+	identityConstant.Mul(&state.relation.Challenges.EtaPart, &state.relation.Index.SlotLabel).
+		Add(&identityConstant, &state.relation.Challenges.Gamma)
+	var identityLinear [LocalWireCount]fr.Element
 	for wire := 0; wire < LocalWireCount; wire++ {
-		fillFastExtendedEvaluations(scratch, state.relation.Tags[wire], extendedDomain)
+		identityLinear[wire].Mul(&state.relation.Challenges.EtaX, &state.relation.Index.WireCosets[wire])
+	}
+	parallelFastLoop(len(fEvaluations), func(start, end int) {
+		for index := start; index < end; index++ {
+			x := fastDomainElement(extendedDomain, index)
+			var identityProduct fr.Element
+			identityProduct.SetOne()
+			for wire := 0; wire < LocalWireCount; wire++ {
+				var identityTag, linearTerm fr.Element
+				linearTerm.Mul(&identityLinear[wire], &x)
+				identityTag.Add(&wireEvaluations[wire][index], &identityConstant).
+					Add(&identityTag, &linearTerm)
+				identityProduct.Mul(&identityProduct, &identityTag)
+			}
+			fEvaluations[index].SetOne()
+			fPrimeEvaluations[index] = identityProduct
+		}
+	})
+	for wire := 0; wire < LocalWireCount; wire++ {
+		fillFastExtendedEvaluations(scratch, state.relation.Tags[wire], state.domain, extendedDomain)
 		multiplyFastPointwise(fEvaluations, scratch)
 	}
-	for wire := 0; wire < LocalWireCount; wire++ {
-		fillFastExtendedEvaluations(scratch, state.relation.IdentityTags[wire], extendedDomain)
-		multiplyFastPointwise(fPrimeEvaluations, scratch)
-	}
-
-	zEvaluations := fastExtendedEvaluations(state.relation.Accumulator, extendedDomain)
-	for index := range fEvaluations {
-		fEvaluations[index].Mul(&fEvaluations[index], &zEvaluations[index])
-	}
-	zOmega := make([]fr.Element, t)
-	power := fr.One()
-	for coefficient := range zOmega {
-		zOmega[coefficient].Mul(&state.relation.Accumulator[coefficient], &power)
-		power.Mul(&power, &state.relation.Omega)
-	}
-	fillFastExtendedEvaluations(scratch, zOmega, extendedDomain)
-	for index := range fEvaluations {
-		var term fr.Element
-		term.Mul(&scratch[index], &fPrimeEvaluations[index])
-		fEvaluations[index].Sub(&fEvaluations[index], &term)
-	}
-	fillFastExtendedEvaluations(scratch, state.fixed.lStar, extendedDomain)
-	for index := range fEvaluations {
-		var term fr.Element
-		term.Mul(&scratch[index], &state.relation.EndpointCorrection)
-		fEvaluations[index].Sub(&fEvaluations[index], &term)
-	}
+	zEvaluations := fastExtendedEvaluations(state.relation.Accumulator, state.domain, extendedDomain)
+	parallelFastLoop(len(fEvaluations), func(start, end int) {
+		for index := start; index < end; index++ {
+			fEvaluations[index].Mul(&fEvaluations[index], &zEvaluations[index])
+		}
+	})
+	fillFastShiftedEvaluations(scratch, zEvaluations, len(zEvaluations)/t)
+	parallelFastLoop(len(fEvaluations), func(start, end int) {
+		for index := start; index < end; index++ {
+			var term fr.Element
+			term.Mul(&scratch[index], &fPrimeEvaluations[index])
+			fEvaluations[index].Sub(&fEvaluations[index], &term)
+		}
+	})
+	fillFastLagrangeEvaluations(
+		fPrimeEvaluations,
+		scratch,
+		extendedDomain,
+		t,
+		state.relation.XStar,
+		state.fixed.lZero[0],
+	)
+	parallelFastLoop(len(fEvaluations), func(start, end int) {
+		for index := start; index < end; index++ {
+			var term fr.Element
+			term.Mul(&scratch[index], &state.relation.EndpointCorrection)
+			fEvaluations[index].Sub(&fEvaluations[index], &term)
+		}
+	})
 
 	var lambdaSquared fr.Element
 	lambdaSquared.Square(&lambda)
-	fillFastExtendedEvaluations(scratch, state.fixed.lZero, extendedDomain)
 	one := fr.One()
-	for index := range gate {
-		var boundary, transition fr.Element
-		boundary.Sub(&zEvaluations[index], &one).Mul(&boundary, &scratch[index]).Mul(&boundary, &lambda)
-		transition.Mul(&fEvaluations[index], &lambdaSquared)
-		gate[index].Add(&gate[index], &boundary).Add(&gate[index], &transition)
-	}
+	parallelFastLoop(len(gate), func(start, end int) {
+		for index := start; index < end; index++ {
+			var boundary, transition fr.Element
+			boundary.Sub(&zEvaluations[index], &one).Mul(&boundary, &fPrimeEvaluations[index]).Mul(&boundary, &lambda)
+			transition.Mul(&fEvaluations[index], &lambdaSquared)
+			gate[index].Add(&gate[index], &boundary).Add(&gate[index], &transition)
+		}
+	})
 
 	extendedDomain.FFTInverse(gate, fft.DIF)
 	fft.BitReverse(gate)
@@ -494,8 +560,14 @@ func validateFastLocalPIOPOnlineTable(table LocalPIOPTable, t int) error {
 }
 
 func validateFastLocalPIOPFixed(fixed *FastLocalPIOPFixed) error {
-	if fixed == nil || fixed.domain == nil || fixed.domainSize < 2 || !isPowerOfTwo(fixed.domainSize) {
+	if fixed == nil || fixed.domain == nil || fixed.extendedDomain == nil || fixed.convolutionDomain == nil ||
+		fixed.domainSize < 2 || !isPowerOfTwo(fixed.domainSize) {
 		return fmt.Errorf("%w: nil or malformed preprocessed fixed state", ErrInvalidLocalPIOPTable)
+	}
+	if fixed.domain.Cardinality != uint64(fixed.domainSize) ||
+		fixed.extendedDomain.Cardinality != uint64(4*fixed.domainSize) ||
+		fixed.convolutionDomain.Cardinality != uint64(2*fixed.domainSize) {
+		return fmt.Errorf("%w: malformed preprocessed FFT domains", ErrInvalidLocalPIOPTable)
 	}
 	if err := validateFastLocalPIOPDomainSize(fixed.domainSize); err != nil {
 		return err
@@ -514,45 +586,200 @@ func validateFastLocalPIOPFixed(fixed *FastLocalPIOPFixed) error {
 			return fmt.Errorf("%w: malformed preprocessed permutation table %d", ErrInvalidLocalPIOPTable, wire)
 		}
 	}
-	if len(fixed.lZero) != fixed.domainSize || len(fixed.lStar) != fixed.domainSize {
+	if len(fixed.lZero) != fixed.domainSize || len(fixed.lStar) != fixed.domainSize || len(fixed.domainElements) != fixed.domainSize {
 		return fmt.Errorf("%w: malformed preprocessed Lagrange basis", ErrInvalidLocalPIOPTable)
 	}
 	return nil
 }
 
-func fastExtendedEvaluations(coefficients []fr.Element, domain *fft.Domain) []fr.Element {
-	result := make([]fr.Element, int(domain.Cardinality))
-	fillFastExtendedEvaluations(result, coefficients, domain)
+func fastExtendedEvaluations(coefficients []fr.Element, baseDomain, extendedDomain *fft.Domain) []fr.Element {
+	result := make([]fr.Element, int(extendedDomain.Cardinality))
+	fillFastExtendedEvaluations(result, coefficients, baseDomain, extendedDomain)
 	return result
 }
 
-func fillFastExtendedEvaluations(destination, coefficients []fr.Element, domain *fft.Domain) {
+func (fixed *FastLocalPIOPFixed) preprocessExtendedSelectors() {
+	for _, selector := range []LocalSelector{LocalSelectorM, LocalSelectorL, LocalSelectorR, LocalSelectorO} {
+		if len(fixed.extendedSelectors[selector]) == int(fixed.extendedDomain.Cardinality) {
+			continue
+		}
+		fixed.extendedSelectors[selector] = fastExtendedEvaluations(
+			fixed.selectors[selector],
+			fixed.domain,
+			fixed.extendedDomain,
+		)
+	}
+}
+
+func (state *FastLocalPIOPState) fastSelectorEvaluations(selector LocalSelector) []fr.Element {
+	if cached := state.fixed.extendedSelectors[selector]; len(cached) == int(state.fixed.extendedDomain.Cardinality) {
+		return cloneLocalElements(cached)
+	}
+	return fastExtendedEvaluations(state.relation.Selectors[selector], state.domain, state.fixed.extendedDomain)
+}
+
+func (state *FastLocalPIOPState) fillFastSelectorEvaluations(destination []fr.Element, selector LocalSelector) {
+	if cached := state.fixed.extendedSelectors[selector]; len(cached) == len(destination) {
+		copy(destination, cached)
+		return
+	}
+	fillFastExtendedEvaluations(destination, state.relation.Selectors[selector], state.domain, state.fixed.extendedDomain)
+}
+
+// fillFastExtendedEvaluations uses one cached size-4T domain transform. The
+// four-FFTPart alternative used by Pianist was measured here as slower due to
+// its per-part copies and allocations once fixed selectors were preprocessed.
+func fillFastExtendedEvaluations(destination, coefficients []fr.Element, baseDomain, extendedDomain *fft.Domain) {
+	_ = baseDomain
 	for index := range destination {
 		destination[index].SetZero()
 	}
 	copy(destination, coefficients)
+	extendedDomain.FFT(destination, fft.DIF)
+	fft.BitReverse(destination)
+}
+
+func fillFastExtendedEvaluationsSum(destination, left, right []fr.Element, domain *fft.Domain) {
+	for index := range destination {
+		destination[index].SetZero()
+	}
+	copy(destination, left)
+	parallelFastLoop(len(right), func(start, end int) {
+		for index := start; index < end; index++ {
+			destination[index].Add(&destination[index], &right[index])
+		}
+	})
 	domain.FFT(destination, fft.DIF)
 	fft.BitReverse(destination)
 }
 
-func addFastPointwise(destination, source []fr.Element) {
-	for index := range destination {
-		destination[index].Add(&destination[index], &source[index])
+func fastDomainElement(domain *fft.Domain, index int) fr.Element {
+	half := int(domain.Cardinality / 2)
+	if index <= half {
+		return domain.Twiddles[0][index]
 	}
+	var result fr.Element
+	result.Neg(&domain.Twiddles[0][index-half])
+	return result
+}
+
+func fillFastShiftedEvaluations(destination, source []fr.Element, naturalShift int) {
+	mask := len(source) - 1
+	parallelFastLoop(len(source), func(start, end int) {
+		for index := start; index < end; index++ {
+			destination[index] = source[(index+naturalShift)&mask]
+		}
+	})
+}
+
+// fillFastLagrangeEvaluations evaluates L_0 and L_{omega^-1} directly on the
+// size-4T quotient domain. One batch inversion of
+// (x-1)(x-omega^-1) replaces two complete FFTs.
+func fillFastLagrangeEvaluations(
+	lZero, lStar []fr.Element,
+	domain *fft.Domain,
+	baseSize int,
+	xStar, inverseBaseSize fr.Element,
+) {
+	denominatorProducts := lZero
+	one := fr.One()
+	parallelFastLoop(len(denominatorProducts), func(start, end int) {
+		for index := start; index < end; index++ {
+			if index%4 == 0 {
+				denominatorProducts[index].SetZero()
+				continue
+			}
+			x := fastDomainElement(domain, index)
+			var xMinusOne, xMinusStar fr.Element
+			xMinusOne.Sub(&x, &one)
+			xMinusStar.Sub(&x, &xStar)
+			denominatorProducts[index].Mul(&xMinusOne, &xMinusStar)
+		}
+	})
+	inverseProducts := fr.BatchInvert(denominatorProducts)
+
+	quarterRoot := fastDomainElement(domain, baseSize)
+	var numeratorByResidue [4]fr.Element
+	power := fr.One()
+	for residue := 0; residue < 4; residue++ {
+		numeratorByResidue[residue].Sub(&power, &one)
+		power.Mul(&power, &quarterRoot)
+	}
+	starIndex := len(lStar) - len(lStar)/baseSize
+	parallelFastLoop(len(lZero), func(start, end int) {
+		for index := start; index < end; index++ {
+			if index%4 == 0 {
+				lZero[index].SetZero()
+				lStar[index].SetZero()
+				if index == 0 {
+					lZero[index].SetOne()
+				}
+				if index == starIndex {
+					lStar[index].SetOne()
+				}
+				continue
+			}
+			x := fastDomainElement(domain, index)
+			var xMinusOne, xMinusStar, scale fr.Element
+			xMinusOne.Sub(&x, &one)
+			xMinusStar.Sub(&x, &xStar)
+			scale.Mul(&numeratorByResidue[index%4], &inverseBaseSize).
+				Mul(&scale, &inverseProducts[index])
+			lZero[index].Mul(&scale, &xMinusStar)
+			lStar[index].Mul(&scale, &xMinusOne).Mul(&lStar[index], &xStar)
+		}
+	})
+}
+
+func addFastPointwise(destination, source []fr.Element) {
+	parallelFastLoop(len(destination), func(start, end int) {
+		for index := start; index < end; index++ {
+			destination[index].Add(&destination[index], &source[index])
+		}
+	})
 }
 
 func addFastPointwiseProduct(destination, left, right []fr.Element) {
-	for index := range destination {
-		var term fr.Element
-		term.Mul(&left[index], &right[index])
-		destination[index].Add(&destination[index], &term)
-	}
+	parallelFastLoop(len(destination), func(start, end int) {
+		for index := start; index < end; index++ {
+			var term fr.Element
+			term.Mul(&left[index], &right[index])
+			destination[index].Add(&destination[index], &term)
+		}
+	})
 }
 
 func multiplyFastPointwise(destination, source []fr.Element) {
-	for index := range destination {
-		destination[index].Mul(&destination[index], &source[index])
+	parallelFastLoop(len(destination), func(start, end int) {
+		for index := start; index < end; index++ {
+			destination[index].Mul(&destination[index], &source[index])
+		}
+	})
+}
+
+func multiplyFastEvaluationFamilies(families [LocalWireCount][]fr.Element, size int) []fr.Element {
+	result := make([]fr.Element, size)
+	parallelFastLoop(size, func(start, end int) {
+		for row := start; row < end; row++ {
+			result[row].SetOne()
+			for wire := 0; wire < LocalWireCount; wire++ {
+				result[row].Mul(&result[row], &families[wire][row])
+			}
+		}
+	})
+	return result
+}
+
+func parallelFastLoop(size int, work func(start, end int)) {
+	tasks := runtime.GOMAXPROCS(0)
+	if size <= 0 {
+		return
 	}
+	if tasks <= 1 {
+		work(0, size)
+		return
+	}
+	utils.Parallelize(size, work, tasks)
 }
 
 // fastDivideByLocalVanishing performs synthetic division by X^T-1. For a

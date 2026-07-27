@@ -15,7 +15,7 @@ import (
 const (
 	// OpeningTranscriptDomain is the protocol-wide domain separator for the
 	// experimental DLinKZG opening transcript.
-	OpeningTranscriptDomain = "DLinKZG/opening-transcript/v1"
+	OpeningTranscriptDomain = "DLinKZG/opening-transcript/v2"
 
 	challengeHashDomain = "DLinKZG/hash-to-field/sha256/v1"
 )
@@ -98,11 +98,10 @@ type U2Message struct {
 	BatchAtBetaInverse   [4]fr.Element
 }
 
-// U3Message fixes the two same-set quotients and the two directional source
+// U3Message fixes the nested-set quotient and the two directional source
 // quotients before the verifier-only delta challenge is sampled.
 type U3Message struct {
-	WG  bn254.G1Affine
-	WL  bn254.G1Affine
+	WN  bn254.G1Affine
 	PiZ bn254.G1Affine
 	PiY bn254.G1Affine
 }
@@ -308,15 +307,14 @@ func (t *OpeningTranscript) AppendU3(message U3Message) error {
 	if err := t.expect(stepU3); err != nil {
 		return err
 	}
-	points := []*bn254.G1Affine{&message.WG, &message.WL, &message.PiZ, &message.PiY}
+	points := []*bn254.G1Affine{&message.WN, &message.PiZ, &message.PiY}
 	for i := range points {
 		if err := validateTranscriptG1(points[i]); err != nil {
 			return fmt.Errorf("%w: U3 commitment %d", err, i)
 		}
 	}
-	payload := make([]byte, 0, 4*bn254.SizeOfG1AffineCompressed)
-	payload = appendG1(payload, &message.WG)
-	payload = appendG1(payload, &message.WL)
+	payload := make([]byte, 0, 3*bn254.SizeOfG1AffineCompressed)
+	payload = appendG1(payload, &message.WN)
 	payload = appendG1(payload, &message.PiZ)
 	payload = appendG1(payload, &message.PiY)
 	t.appendRecord("U3", payload)

@@ -73,6 +73,7 @@ type CompiledPartySetup struct {
 	ConstraintSystem *cs.SparseR1CS
 	Preprocessing    *LocalPIOPPreprocessing
 	FastFixed        *FastLocalPIOPFixed
+	FastTaylorShift  *cryptodlinkzg.FastTaylorShiftPrecomputation
 	RowSRS           *cryptodlinkzg.PartyRowSRS
 	FixedCommitments LocalPIOPFixedCommitmentSlot
 }
@@ -167,13 +168,31 @@ func NewDeterministicCompiledSetup(
 	}
 
 	fixedSlots := make([]LocalPIOPFixedCommitmentSlot, partitions)
+	var fastTaylorShift *cryptodlinkzg.FastTaylorShiftPrecomputation
 	for rank := 0; rank < partitions; rank++ {
-		fastFixed[rank], err = PreprocessFastLocalPIOPFixed(
-			preprocessings[rank].FixedTable(),
-			preprocessings[rank].Index(),
-		)
+		if rank == 0 {
+			fastFixed[rank], err = PreprocessFastLocalPIOPFixed(
+				preprocessings[rank].FixedTable(),
+				preprocessings[rank].Index(),
+			)
+		} else {
+			fastFixed[rank], err = preprocessFastLocalPIOPFixedWithDomains(
+				preprocessings[rank].FixedTable(),
+				preprocessings[rank].Index(),
+				fastFixed[0].domain,
+				fastFixed[0].extendedDomain,
+				fastFixed[0].convolutionDomain,
+			)
+		}
 		if err != nil {
 			return nil, fmt.Errorf("%w: fast fixed rank %d: %v", ErrInvalidCompiledSetup, rank, err)
+		}
+		if rank == 0 {
+			fastTaylorShift = cryptodlinkzg.NewFastTaylorShiftPrecomputation(
+				t,
+				shift.Sigma,
+				fastFixed[0].convolutionDomain,
+			)
 		}
 		rowSRS, srsErr := cryptodlinkzg.NewDeterministicPartyRowSRSWithShift(
 			partitions, t, rank, tauY, tauZ, shift.Sigma,
@@ -190,6 +209,7 @@ func NewDeterministicCompiledSetup(
 			ConstraintSystem: spr,
 			Preprocessing:    preprocessings[rank],
 			FastFixed:        fastFixed[rank],
+			FastTaylorShift:  fastTaylorShift,
 			RowSRS:           rowSRS,
 			FixedCommitments: fixedSlots[rank],
 		}
@@ -282,7 +302,8 @@ func (setup *CompiledSetup) Validate() error {
 	}
 	for rank := 0; rank < m; rank++ {
 		party := &setup.Parties[rank]
-		if party.Rank != rank || party.ConstraintSystem == nil || party.Preprocessing == nil || party.FastFixed == nil || party.RowSRS == nil {
+		if party.Rank != rank || party.ConstraintSystem == nil || party.Preprocessing == nil || party.FastFixed == nil ||
+			party.FastTaylorShift == nil || party.FastTaylorShift.PolynomialLength() != t || party.RowSRS == nil {
 			return fmt.Errorf("%w: malformed party role at manifest rank %d", ErrInvalidCompiledSetup, rank)
 		}
 		if party.Metadata != setup.Metadata {

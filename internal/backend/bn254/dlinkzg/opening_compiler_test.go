@@ -76,8 +76,7 @@ func TestDLinkZGOpeningRejectsEveryPhaseTamper(t *testing.T) {
 		{"U2 partial beta inverse", func(p *DLinkZGOpeningProof) { p.U2.PartialAtBetaInverse[0].Add(&p.U2.PartialAtBetaInverse[0], &one) }},
 		{"U2 batch beta", func(p *DLinkZGOpeningProof) { p.U2.BatchAtBeta[1].Add(&p.U2.BatchAtBeta[1], &one) }},
 		{"U2 derived inverse", func(p *DLinkZGOpeningProof) { p.U2.BatchAtBetaInverse[3].Add(&p.U2.BatchAtBetaInverse[3], &one) }},
-		{"U3 WG", func(p *DLinkZGOpeningProof) { p.U3.WG = point }},
-		{"U3 WL", func(p *DLinkZGOpeningProof) { p.U3.WL = point }},
+		{"U3 WN", func(p *DLinkZGOpeningProof) { p.U3.WN = point }},
 		{"U3 piZ", func(p *DLinkZGOpeningProof) { p.U3.PiZ = point }},
 		{"U3 piY", func(p *DLinkZGOpeningProof) { p.U3.PiY = point }},
 	}
@@ -519,17 +518,22 @@ func assertDLinkZGOpeningMatchesMonolithic(t testing.TB, fixture dlinkzgOpeningT
 	if err != nil {
 		t.Fatal(err)
 	}
+	innerScale := fr.One()
+	for i := 0; i < dlinkzgOpeningCircuitClaims; i++ {
+		innerScale.Mul(&innerScale, &challenges.kappa)
+	}
 	statement := cryptodlinkzg.DeltaBatchStatement{
 		SourceCommitment: sourceCommitment,
 		SourceValue:      proof.U2.BatchAtBeta[0],
 		Beta:             challenges.beta,
 		ZChallenge:       challenges.z,
-		NumeratorG:       numeratorG,
-		NumeratorL:       numeratorL,
-		VanishingG:       cryptodlinkzg.VanishingPolynomial(gPoints),
-		VanishingL:       cryptodlinkzg.VanishingPolynomial(lPoints),
+		OuterNumerator:   numeratorG,
+		InnerNumerator:   numeratorL,
+		OuterVanishing:   cryptodlinkzg.VanishingPolynomial(gPoints),
+		InnerVanishing:   cryptodlinkzg.VanishingPolynomial(lPoints),
+		InnerScale:       innerScale,
 	}
-	batchProof := cryptodlinkzg.DeltaBatchProof{PiZ: proof.U3.PiZ, PiY: proof.U3.PiY, WG: proof.U3.WG, WL: proof.U3.WL}
+	batchProof := cryptodlinkzg.DeltaBatchProof{PiZ: proof.U3.PiZ, PiY: proof.U3.PiY, WN: proof.U3.WN}
 	if err := cryptodlinkzg.VerifyDeltaBatch(statement, batchProof, challenges.delta, fixture.monolithic); err != nil {
 		t.Fatalf("monolithic final verifier rejected split proof: %v", err)
 	}

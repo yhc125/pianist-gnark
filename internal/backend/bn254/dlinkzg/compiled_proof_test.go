@@ -26,10 +26,10 @@ func TestCompiledProofInventoryAndRoundTrip(t *testing.T) {
 				t.Fatalf("element counts: %v", err)
 			}
 			wantFields := 6*(bitsForCompiledProofTest(partitions)-1) + 43
-			if g1Elements != 18 || fieldElements != wantFields {
-				t.Fatalf("inventory = (%d G1, %d Fr), want (18 G1, %d Fr)", g1Elements, fieldElements, wantFields)
+			if g1Elements != 17 || fieldElements != wantFields {
+				t.Fatalf("inventory = (%d G1, %d Fr), want (17 G1, %d Fr)", g1Elements, fieldElements, wantFields)
 			}
-			wantBytes := compiledProofHeaderSize + 18*bn254.SizeOfG1AffineCompressed + wantFields*fr.Bytes
+			wantBytes := compiledProofHeaderSize + 17*bn254.SizeOfG1AffineCompressed + wantFields*fr.Bytes
 			if len(encoded) != wantBytes {
 				t.Fatalf("encoded length = %d, want %d", len(encoded), wantBytes)
 			}
@@ -318,8 +318,7 @@ func compiledProofTestFixture(partitions uint64) CompiledProof {
 		proof.U2.BatchAtBeta[i] = field()
 		proof.U2.BatchAtBetaInverse[i] = field()
 	}
-	proof.U3.WG = point()
-	proof.U3.WL = point()
+	proof.U3.WN = point()
 	proof.U3.PiZ = point()
 	proof.U3.PiY = point()
 	return proof

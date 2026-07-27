@@ -88,7 +88,7 @@ type PrototypeStatement struct {
 }
 
 // PrototypeProof contains the SumCheck transcript and the U0--U3 data needed
-// for the scalar Laurent check and final five-pairing equation. Values in the
+// for the scalar Laurent check and final four-pairing equation. Values in the
 // second index of PartialValues are ordered as z_ch, beta, beta^{-1}; values
 // in LinearValues are ordered as beta, beta^{-1} for h_xi,t_0,t_1,S.
 type PrototypeProof struct {
@@ -101,8 +101,7 @@ type PrototypeProof struct {
 	LinearValues       [4][2]fr.Element
 
 	SourceLink cryptodlinkzg.SourceLinkProof
-	WG         bn254.G1Affine
-	WL         bn254.G1Affine
+	WN         bn254.G1Affine
 }
 
 // PrototypeTimings exposes the two outer phases without pretending that the
@@ -293,15 +292,6 @@ func Prove(input PrototypeInput, challenges PrototypeChallenges, srs *cryptodlin
 			ClaimedValues: cloneElements(proof.PartialValues[j][:]),
 		}
 	}
-	gBatch, err := cryptodlinkzg.BuildSameSetQuotient(gInputs, gPoints, challenges.Kappa)
-	if err != nil {
-		return PrototypeStatement{}, PrototypeProof{}, err
-	}
-	proof.WG, err = cryptodlinkzg.CommitZ(gBatch.Quotient, srs)
-	if err != nil {
-		return PrototypeStatement{}, PrototypeProof{}, err
-	}
-
 	lPoints := []fr.Element{challenges.Beta, betaInverse}
 	lInputs := make([]cryptodlinkzg.SameSetInput, len(linearPolynomials))
 	for p := range lInputs {
@@ -310,11 +300,13 @@ func Prove(input PrototypeInput, challenges PrototypeChallenges, srs *cryptodlin
 			ClaimedValues: cloneElements(proof.LinearValues[p][:]),
 		}
 	}
-	lBatch, err := cryptodlinkzg.BuildSameSetQuotient(lInputs, lPoints, challenges.Kappa)
+	nestedBatch, err := cryptodlinkzg.BuildNestedSetQuotient(
+		gInputs, gPoints, lInputs, lPoints, challenges.Kappa,
+	)
 	if err != nil {
 		return PrototypeStatement{}, PrototypeProof{}, err
 	}
-	proof.WL, err = cryptodlinkzg.CommitZ(lBatch.Quotient, srs)
+	proof.WN, err = cryptodlinkzg.CommitZ(nestedBatch.Quotient, srs)
 	if err != nil {
 		return PrototypeStatement{}, PrototypeProof{}, err
 	}
@@ -326,7 +318,7 @@ func Prove(input PrototypeInput, challenges PrototypeChallenges, srs *cryptodlin
 }
 
 // Verify checks the prototype's PIOP transcript, Laurent scalar identity, and
-// final delta-batched five-pairing equation. It does not claim production
+// final delta-batched four-pairing equation. It does not claim production
 // succinctness because PrototypeStatement contains clear O(M) tables.
 func Verify(statement PrototypeStatement, proof PrototypeProof, challenges PrototypeChallenges, srs *cryptodlinkzg.MonomialSRS) error {
 	if err := validatePrototypeStatement(statement, challenges, srs); err != nil {
@@ -448,6 +440,10 @@ func Verify(statement PrototypeStatement, proof PrototypeProof, challenges Proto
 	if err != nil {
 		return err
 	}
+	innerScale := fr.One()
+	for i := 0; i < terminalCircuitClaims; i++ {
+		innerScale.Mul(&innerScale, &challenges.Kappa)
+	}
 
 	sourceCommitment := foldG1(statement.SourceCommitments[:], challenges.Xi)
 	if !proof.SourceLink.ClaimedValue.Equal(&proof.LinearValues[0][0]) {
@@ -458,16 +454,16 @@ func Verify(statement PrototypeStatement, proof PrototypeProof, challenges Proto
 		SourceValue:      proof.SourceLink.ClaimedValue,
 		Beta:             challenges.Beta,
 		ZChallenge:       challenges.ZChallenge,
-		NumeratorG:       numeratorG,
-		NumeratorL:       numeratorL,
-		VanishingG:       cryptodlinkzg.VanishingPolynomial(gPoints),
-		VanishingL:       cryptodlinkzg.VanishingPolynomial(lPoints),
+		OuterNumerator:   numeratorG,
+		InnerNumerator:   numeratorL,
+		OuterVanishing:   cryptodlinkzg.VanishingPolynomial(gPoints),
+		InnerVanishing:   cryptodlinkzg.VanishingPolynomial(lPoints),
+		InnerScale:       innerScale,
 	}
 	batchProof := cryptodlinkzg.DeltaBatchProof{
 		PiZ: proof.SourceLink.PiZ,
 		PiY: proof.SourceLink.PiY,
-		WG:  proof.WG,
-		WL:  proof.WL,
+		WN:  proof.WN,
 	}
 	if err := cryptodlinkzg.VerifyDeltaBatch(batchStatement, batchProof, challenges.Delta, srs); err != nil {
 		return fmt.Errorf("%w: %v", ErrPrototypeOpening, err)

@@ -54,8 +54,7 @@ type ProtocolU2AggregateRecord struct {
 // ProtocolU3AggregateRecord is one party's additive quotient share. PiY is
 // coordinator-only and consequently occurs only in the U3 broadcast.
 type ProtocolU3AggregateRecord struct {
-	WG  bn254.G1Affine
-	WL  bn254.G1Affine
+	WN  bn254.G1Affine
 	PiZ bn254.G1Affine
 }
 
@@ -329,42 +328,40 @@ func UnpackProtocolU2Broadcast(payload MPIPayload) (U2Message, error) {
 	return message, nil
 }
 
-// PackProtocolU3Aggregate packs one party's three additive quotient
-// commitments in WG,WL,PiZ order.
+// PackProtocolU3Aggregate packs one party's nested quotient and source-link
+// quotient in WN,PiZ order.
 func PackProtocolU3Aggregate(message ProtocolU3AggregateRecord) (MPIPayload, error) {
 	return newTypedProtocolPayload(
-		"U3 aggregate", nil, []bn254.G1Affine{message.WG, message.WL, message.PiZ},
-		MPIPayloadShape{G1: 3},
+		"U3 aggregate", nil, []bn254.G1Affine{message.WN, message.PiZ},
+		MPIPayloadShape{G1: 2},
 	)
 }
 
 // UnpackProtocolU3Aggregate validates and decodes one local U3 share.
 func UnpackProtocolU3Aggregate(payload MPIPayload) (ProtocolU3AggregateRecord, error) {
-	validated, err := validateTypedProtocolPayload("U3 aggregate", payload, MPIPayloadShape{G1: 3})
+	validated, err := validateTypedProtocolPayload("U3 aggregate", payload, MPIPayloadShape{G1: 2})
 	if err != nil {
 		return ProtocolU3AggregateRecord{}, err
 	}
-	return ProtocolU3AggregateRecord{WG: validated.G1[0], WL: validated.G1[1], PiZ: validated.G1[2]}, nil
+	return ProtocolU3AggregateRecord{WN: validated.G1[0], PiZ: validated.G1[1]}, nil
 }
 
-// PackProtocolU3Broadcast packs public U3 in WG,WL,PiZ,PiY order.
+// PackProtocolU3Broadcast packs public U3 in WN,PiZ,PiY order.
 func PackProtocolU3Broadcast(message U3Message) (MPIPayload, error) {
 	return newTypedProtocolPayload(
 		"U3 broadcast", nil,
-		[]bn254.G1Affine{message.WG, message.WL, message.PiZ, message.PiY},
-		MPIPayloadShape{G1: 4},
+		[]bn254.G1Affine{message.WN, message.PiZ, message.PiY},
+		MPIPayloadShape{G1: 3},
 	)
 }
 
 // UnpackProtocolU3Broadcast validates and decodes public U3.
 func UnpackProtocolU3Broadcast(payload MPIPayload) (U3Message, error) {
-	validated, err := validateTypedProtocolPayload("U3 broadcast", payload, MPIPayloadShape{G1: 4})
+	validated, err := validateTypedProtocolPayload("U3 broadcast", payload, MPIPayloadShape{G1: 3})
 	if err != nil {
 		return U3Message{}, err
 	}
-	return U3Message{
-		WG: validated.G1[0], WL: validated.G1[1], PiZ: validated.G1[2], PiY: validated.G1[3],
-	}, nil
+	return U3Message{WN: validated.G1[0], PiZ: validated.G1[1], PiY: validated.G1[2]}, nil
 }
 
 func protocolPayloadRoundCount(partitions uint64) (int, error) {

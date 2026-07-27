@@ -21,7 +21,7 @@ const (
 
 	// DLinkZGOpeningInstanceDigestDomain is the canonical domain separator for
 	// the standalone Protocol 2 public instance.
-	DLinkZGOpeningInstanceDigestDomain = "DLinKZG/opening-instance/v1"
+	DLinkZGOpeningInstanceDigestDomain = "DLinKZG/opening-instance/v2"
 )
 
 var (
@@ -34,7 +34,7 @@ var (
 	// ErrDLinkZGOpeningScalarIdentity reports failure of the public Laurent
 	// identity at beta.
 	ErrDLinkZGOpeningScalarIdentity = errors.New("dlinkzg: opening Laurent scalar identity failed")
-	// ErrDLinkZGOpeningRejected wraps a failed final five-pairing product.
+	// ErrDLinkZGOpeningRejected wraps a failed final four-pairing product.
 	ErrDLinkZGOpeningRejected = errors.New("dlinkzg: opening rejected")
 )
 
@@ -134,7 +134,7 @@ func ProveDLinkZGOpening(instance DLinkZGOpeningInstance, input DLinkZGOpeningPr
 
 // VerifyDLinkZGOpening replays Protocol 2 from its public instance and the
 // constant-size verifier SRS, checks the scalar identity, and performs the
-// final five-input pairing product.
+// final four-input pairing product.
 func VerifyDLinkZGOpening(instance DLinkZGOpeningInstance, proof DLinkZGOpeningProof, verifierSRS *cryptodlinkzg.VerifierSRS) error {
 	return verifyDLinkZGOpeningWithTranscript(instance, proof, verifierSRS, newDLinkZGOpeningTranscript)
 }
@@ -159,14 +159,15 @@ func newDLinkZGOpeningTranscript(context TranscriptContext) (dlinkzgOpeningTrans
 }
 
 type dlinkzgOpeningPrepared struct {
-	m       int
-	t       int
-	weights []fr.Element
-	queries [dlinkzgOpeningCircuitClaims][]fr.Element
-	scales  [dlinkzgOpeningCircuitClaims]fr.Element
-	psiQ    [dlinkzgOpeningCircuitClaims][]fr.Element
-	psiR    []fr.Element
-	tree    [dlinkzgOpeningTreeClaims]productCheckPoint
+	m             int
+	t             int
+	weights       []fr.Element
+	circuitRatios [dlinkzgOpeningCircuitClaims]fr.Element
+	queries       [dlinkzgOpeningCircuitClaims][]fr.Element
+	scales        [dlinkzgOpeningCircuitClaims]fr.Element
+	psiQ          [dlinkzgOpeningCircuitClaims][]fr.Element
+	psiR          []fr.Element
+	tree          [dlinkzgOpeningTreeClaims]productCheckPoint
 }
 
 type dlinkzgOpeningLocalState struct {
@@ -255,7 +256,9 @@ func proveDLinkZGOpeningWithTranscript(instance DLinkZGOpeningInstance, input DL
 	}
 	xi, nu, zChallenge := xiOut.Value, nuOut.Value, zOut.Value
 
-	aWeights, bWeights := treeWeightPolynomials(prepared.tree, xi, prepared.t)
+	// A_xi and B_xi have degree < M. Keep their canonical coefficient width
+	// instead of padding them to the local trace bound T.
+	aWeights, bWeights := treeWeightPolynomials(prepared.tree, xi, prepared.m)
 	hCoefficients := make([]fr.Element, prepared.m)
 	var laurentCommitment bn254.G1Jac
 	for rank := 0; rank < prepared.m; rank++ {
@@ -286,7 +289,11 @@ func proveDLinkZGOpeningWithTranscript(instance DLinkZGOpeningInstance, input DL
 			AXi:  aWeights,
 			BXi:  bWeights,
 		}
-		locals[rank].laurent = cryptodlinkzg.BuildLocalLaurent(locals[rank].input)
+		locals[rank].laurent = cryptodlinkzg.BuildLocalLaurentWithGeometricCircuitQueries(
+			locals[rank].input,
+			prepared.circuitRatios,
+			nil,
+		)
 		commitment, commitErr := input.PartySRS[rank].CommitZ(locals[rank].laurent)
 		if commitErr != nil {
 			return DLinkZGOpeningProof{}, fmt.Errorf("%w: U1 Laurent rank %d: %v", ErrInvalidDLinkZGOpeningInput, rank, commitErr)
@@ -383,7 +390,7 @@ func proveDLinkZGOpeningWithTranscript(instance DLinkZGOpeningInstance, input DL
 	}
 	gPoints := []fr.Element{zChallenge, beta, betaInverse}
 	lPoints := []fr.Element{beta, betaInverse}
-	var wG, wL, piZ bn254.G1Jac
+	var wN, piZ bn254.G1Jac
 	for rank := 0; rank < prepared.m; rank++ {
 		gInputs := make([]cryptodlinkzg.SameSetInput, dlinkzgOpeningCircuitClaims)
 		for claim := 0; claim < dlinkzgOpeningCircuitClaims; claim++ {
@@ -398,16 +405,6 @@ func proveDLinkZGOpeningWithTranscript(instance DLinkZGOpeningInstance, input DL
 				},
 			}
 		}
-		gBatch, batchErr := cryptodlinkzg.BuildSameSetQuotient(gInputs, gPoints, kappa)
-		if batchErr != nil {
-			return DLinkZGOpeningProof{}, fmt.Errorf("%w: local G batch rank %d: %v", ErrDLinkZGOpeningRejected, rank, batchErr)
-		}
-		wGShare, commitErr := input.PartySRS[rank].CommitZ(gBatch.Quotient)
-		if commitErr != nil {
-			return DLinkZGOpeningProof{}, commitErr
-		}
-		dlinkzgOpeningAddG1(&wG, wGShare)
-
 		lPolynomials := [4][]fr.Element{locals[rank].h, locals[rank].t0, locals[rank].t1, locals[rank].laurent}
 		lInputs := make([]cryptodlinkzg.SameSetInput, len(lPolynomials))
 		for polynomial := range lPolynomials {
@@ -418,15 +415,17 @@ func proveDLinkZGOpeningWithTranscript(instance DLinkZGOpeningInstance, input DL
 			}
 			lInputs[polynomial] = cryptodlinkzg.SameSetInput{Polynomial: lPolynomials[polynomial], ClaimedValues: values}
 		}
-		lBatch, batchErr := cryptodlinkzg.BuildSameSetQuotient(lInputs, lPoints, kappa)
+		nestedBatch, batchErr := cryptodlinkzg.BuildNestedSetQuotient(
+			gInputs, gPoints, lInputs, lPoints, kappa,
+		)
 		if batchErr != nil {
-			return DLinkZGOpeningProof{}, fmt.Errorf("%w: local L batch rank %d: %v", ErrDLinkZGOpeningRejected, rank, batchErr)
+			return DLinkZGOpeningProof{}, fmt.Errorf("%w: local nested batch rank %d: %v", ErrDLinkZGOpeningRejected, rank, batchErr)
 		}
-		wLShare, commitErr := input.PartySRS[rank].CommitZ(lBatch.Quotient)
+		wNShare, commitErr := input.PartySRS[rank].CommitZ(nestedBatch.Quotient)
 		if commitErr != nil {
 			return DLinkZGOpeningProof{}, commitErr
 		}
-		dlinkzgOpeningAddG1(&wL, wLShare)
+		dlinkzgOpeningAddG1(&wN, wNShare)
 
 		pXi := make([]fr.Element, prepared.t)
 		xiPower := fr.One()
@@ -444,8 +443,7 @@ func proveDLinkZGOpeningWithTranscript(instance DLinkZGOpeningInstance, input DL
 		}
 		dlinkzgOpeningAddG1(&piZ, piZShare)
 	}
-	proof.U3.WG.FromJacobian(&wG)
-	proof.U3.WL.FromJacobian(&wL)
+	proof.U3.WN.FromJacobian(&wN)
 	proof.U3.PiZ.FromJacobian(&piZ)
 	qY, sourceValue := cryptodlinkzg.SyntheticDivision(hCoefficients, beta)
 	if !sourceValue.Equal(&proof.U2.BatchAtBeta[0]) {
@@ -607,6 +605,7 @@ func prepareDLinkZGOpeningInstance(instance DLinkZGOpeningInstance) (dlinkzgOpen
 	for i := range shiftedQueries {
 		shiftedQueries[i].Sub(&shiftedQueries[i], &instance.Shift)
 	}
+	prepared.circuitRatios = shiftedQueries
 	queries, scales, err := translatedQueries(shiftedQueries, bits.Len(uint(instance.LocalDomainSize))-1)
 	if err != nil {
 		return prepared, fmt.Errorf("%w: %v", ErrInvalidDLinkZGOpeningInstance, err)
@@ -821,6 +820,10 @@ func verifyDLinkZGOpeningFinal(instance DLinkZGOpeningInstance, proof DLinkZGOpe
 	if err != nil {
 		return fmt.Errorf("%w: L numerator: %v", ErrDLinkZGOpeningRejected, err)
 	}
+	innerScale := fr.One()
+	for i := 0; i < dlinkzgOpeningCircuitClaims; i++ {
+		innerScale.Mul(&innerScale, &kappa)
+	}
 
 	sourceCommitment := foldG1(instance.SourceCommitments[:], xi)
 	statement := cryptodlinkzg.DeltaBatchStatement{
@@ -828,16 +831,16 @@ func verifyDLinkZGOpeningFinal(instance DLinkZGOpeningInstance, proof DLinkZGOpe
 		SourceValue:      proof.U2.BatchAtBeta[0],
 		Beta:             beta,
 		ZChallenge:       zChallenge,
-		NumeratorG:       numeratorG,
-		NumeratorL:       numeratorL,
-		VanishingG:       cryptodlinkzg.VanishingPolynomial(gPoints),
-		VanishingL:       cryptodlinkzg.VanishingPolynomial(lPoints),
+		OuterNumerator:   numeratorG,
+		InnerNumerator:   numeratorL,
+		OuterVanishing:   cryptodlinkzg.VanishingPolynomial(gPoints),
+		InnerVanishing:   cryptodlinkzg.VanishingPolynomial(lPoints),
+		InnerScale:       innerScale,
 	}
 	batchProof := cryptodlinkzg.DeltaBatchProof{
 		PiZ: proof.U3.PiZ,
 		PiY: proof.U3.PiY,
-		WG:  proof.U3.WG,
-		WL:  proof.U3.WL,
+		WN:  proof.U3.WN,
 	}
 	if err := verifierSRS.VerifyDeltaBatch(statement, batchProof, delta); err != nil {
 		return fmt.Errorf("%w: %v", ErrDLinkZGOpeningRejected, err)

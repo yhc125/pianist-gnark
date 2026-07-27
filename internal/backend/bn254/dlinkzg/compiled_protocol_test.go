@@ -17,7 +17,7 @@ type compiledProtocolTestFixture struct {
 }
 
 func TestCompiledProtocolRealSparseR1CSM2M4(t *testing.T) {
-	expectedSizes := map[int]int{2: 2164, 4: 2356}
+	expectedSizes := map[int]int{2: 2132, 4: 2324}
 	for _, partitions := range []int{2, 4} {
 		t.Run(adapterWorldName(partitions), func(t *testing.T) {
 			fixture := newCompiledProtocolTestFixture(t, partitions, byte(10+partitions))
@@ -47,7 +47,7 @@ func TestCompiledProtocolRealSparseR1CSM2M4(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			if g1 != 18 || fields != 6*(bitsForCompiledProtocol(partitions))+43 {
+			if g1 != 17 || fields != 6*(bitsForCompiledProtocol(partitions))+43 {
 				t.Fatalf("proof inventory = %d G1, %d Fr", g1, fields)
 			}
 		})
@@ -130,7 +130,7 @@ func TestCompiledProtocolRejectsEveryPublicPhaseTamper(t *testing.T) {
 			proof.U2.PartialAtBeta[0].Add(&proof.U2.PartialAtBeta[0], &one)
 		}},
 		{"U3", func(proof *CompiledProof) {
-			sourceCommitmentAdd(&proof.U3.WG, &pointIncrement)
+			sourceCommitmentAdd(&proof.U3.WN, &pointIncrement)
 		}},
 	}
 	for _, test := range tests {

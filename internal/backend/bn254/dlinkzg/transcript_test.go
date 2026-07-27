@@ -171,7 +171,7 @@ func TestOpeningTranscriptBindsU2AndU3Payloads(t *testing.T) {
 	}
 
 	mutatedU3 := u3
-	mutatedU3.WL = testG1(101)
+	mutatedU3.WN = testG1(101)
 	_, afterU3Mutation := runTestOpeningTranscript(t, "", context, u0, u1, u2, mutatedU3)
 	for i := 0; i < 5; i++ {
 		if !base[i].Value.Equal(&afterU3Mutation[i].Value) {
@@ -327,14 +327,14 @@ func TestOpeningTranscriptGoldenVector(t *testing.T) {
 	context := testTranscriptContext()
 	u0, u1, u2, u3 := testOpeningMessages()
 	transcript, challenges := runTestOpeningTranscript(t, "", context, u0, u1, u2, u3)
-	expectedCounters := [6]uint32{2, 0, 6, 1, 9, 4}
+	expectedCounters := [6]uint32{3, 2, 3, 17, 2, 2}
 	expectedValues := [6]string{
-		"296b0d79cfeac9493072fc5e62fe481e673f3fdb32ea44ada3eb1412a74d188d",
-		"08633833d9f56385f92b435885491c61164fda8f616e589a11e5b2e2c442a10e",
-		"08745dc2ad7c27982e71b7cb2ab561ea40728d94354e1dc117d8997e6979fe6b",
-		"0be18123a8f1abf2948de81425c081849f167a41fe67b1698a2c858fb57b8b1b",
-		"07d90dd5f36c4145f857d6cb6aad98a714b3f71cc344ec3b6253bba31dd8ad90",
-		"1236d3211173813704cafe2e1fc8b109daadc4bba16663887e26f41d1b3fea65",
+		"0021bd3847ad5deb96379987bc44f908734e6b9b5702a71b108c3a5e3d66c1aa",
+		"2b1123b7441289400cbbedc7fa37184be37a521298763ae9dc74f881014732d3",
+		"1de178845499174fdae519516eddeaf4838dcde21fdc2d27af090c210d837446",
+		"12626bde165cbe10b33d8229bd2b9a76e7ced4804aff2b518b9f8a82a00e8717",
+		"0b8a9b88f8907da1f38006a89e363eb7b95c15c1e890b14bae4fa08e5dd3a49d",
+		"25777affbe7c7d2a22f0777645dc0c2bfed4377292b05f12a9231d2ef4d621f4",
 	}
 	for i := range challenges {
 		encoded := challenges[i].Value.Bytes()
@@ -343,7 +343,7 @@ func TestOpeningTranscriptGoldenVector(t *testing.T) {
 		}
 	}
 	digest := transcript.Digest()
-	const expectedDigest = "aca800f702a3b8213ac57b288b4403b105a74764ec7d824b1cb4c0467ccb5998"
+	const expectedDigest = "3736673ed280321fd23bc5ccb215c78e5eb3d3dfc5fb887abecfab4dc8933a51"
 	if hex.EncodeToString(digest[:]) != expectedDigest {
 		t.Fatalf("golden transcript digest mismatch: %s", hex.EncodeToString(digest[:]))
 	}
@@ -476,7 +476,7 @@ func testOpeningMessages() (U0Message, U1Message, U2Message, U3Message) {
 		BatchAtBeta:          [4]fr.Element{fr.NewElement(41), fr.NewElement(42), fr.NewElement(43), fr.NewElement(44)},
 		BatchAtBetaInverse:   [4]fr.Element{fr.NewElement(51), fr.NewElement(52), fr.NewElement(53), fr.NewElement(54)},
 	}
-	u3 := U3Message{WG: testG1(6), WL: testG1(7), PiZ: testG1(8), PiY: testG1(9)}
+	u3 := U3Message{WN: testG1(6), PiZ: testG1(8), PiY: testG1(9)}
 	return u0, u1, u2, u3
 }
 

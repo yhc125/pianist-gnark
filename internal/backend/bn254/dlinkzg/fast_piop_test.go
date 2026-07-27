@@ -304,7 +304,7 @@ func TestFastLocalPIOPProductionSourceUsesExtendedFFTPath(t *testing.T) {
 		}
 	}
 	for _, required := range [][]byte{
-		[]byte("fft.NewDomain(uint64(4 * t))"),
+		[]byte("extendedDomain := state.fixed.extendedDomain"),
 		[]byte(".FFT("),
 		[]byte(".FFTInverse("),
 		[]byte("fastDivideByLocalVanishing"),

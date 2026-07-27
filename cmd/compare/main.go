@@ -84,7 +84,7 @@ func boolMetric(value bool) float64 {
 }
 
 const (
-	dlinkzgCompareProtocolVersion = "dlinkzg-compare/v1"
+	dlinkzgCompareProtocolVersion = "dlinkzg-compare/v2"
 	dlinkzgSessionNonceDomain     = "DLinKZG/compare/session-nonce/v1"
 	dlinkzgProtocolOperations     = uint64(17)
 	dlinkzgProtocolHeaderBytes    = uint64(20)
@@ -213,12 +213,13 @@ func expectedDLinKZGRootAccounting(partitions uint64) (payloadSent, payloadRecei
 	for value := partitions; value > 1; value >>= 1 {
 		logPartitions++
 	}
-	payloadReceived = partitions * 1440
-	payloadSent = partitions * (2016 + 192*logPartitions)
+	edges := partitions - 1
+	payloadReceived = edges * 1408
+	payloadSent = edges * (1984 + 192*logPartitions)
 	// Eight worker-to-root and nine root-to-worker records cross each star
 	// edge. Every ProtocolMPIChannel record has one fixed 20-byte header.
-	wireReceived = payloadReceived + partitions*8*dlinkzgProtocolHeaderBytes
-	wireSent = payloadSent + partitions*9*dlinkzgProtocolHeaderBytes
+	wireReceived = payloadReceived + edges*8*dlinkzgProtocolHeaderBytes
+	wireSent = payloadSent + edges*9*dlinkzgProtocolHeaderBytes
 	return payloadSent, payloadReceived, wireSent, wireReceived, nil
 }
 
@@ -231,7 +232,7 @@ func dlinkzgCommunicationMetrics(
 	if err != nil {
 		return nil, err
 	}
-	if accounting.Rank != 0 || accounting.WorldSize != partitions+1 ||
+	if accounting.Rank != 0 || accounting.WorldSize != partitions ||
 		accounting.PartitionCount != partitions || accounting.Operations != dlinkzgProtocolOperations {
 		return nil, fmt.Errorf("unexpected dlinkzg root accounting identity: %+v", accounting)
 	}
@@ -402,6 +403,7 @@ func collectRootResourceSamples() (coordinator, workerMax, rankSum uint64, suppo
 		return 0, 0, 0, 0, err
 	}
 	coordinator = local.PeakRSSBytes
+	workerMax = local.PeakRSSBytes
 	rankSum = local.PeakRSSBytes
 	if local.PeakRSSSupported {
 		supportedRanks++
@@ -466,10 +468,10 @@ func validateConfig(cfg config) error {
 		if cfg.workers > uint64(^uint(0)>>1) {
 			return fmt.Errorf("dlinkzg worker count %d exceeds this platform's int range", cfg.workers)
 		}
-		if mpi.WorldSize != cfg.workers+1 {
+		if mpi.WorldSize != cfg.workers {
 			return fmt.Errorf(
-				"dlinkzg --workers=%d requires MPI world size M+1=%d; got %d",
-				cfg.workers, cfg.workers+1, mpi.WorldSize,
+				"dlinkzg --workers=%d requires MPI world size M=%d; got %d",
+				cfg.workers, cfg.workers, mpi.WorldSize,
 			)
 		}
 	}
@@ -657,6 +659,7 @@ func runGPiano(cfg config) (adapterResult, error) {
 			"heap_alloc_bytes":              float64(memory.Alloc),
 			"heap_sys_bytes":                float64(memory.HeapSys),
 			"peak_rss_coordinator_bytes":    float64(coordinatorPeakRSS),
+			"peak_rss_rank0_bytes":          float64(coordinatorPeakRSS),
 			"peak_rss_worker_max_bytes":     float64(workerPeakRSS),
 			"peak_rss_rank_sum_bytes":       float64(rankSumPeakRSS),
 			"peak_rss_supported_rank_count": float64(supportedRSSRanks),
@@ -693,9 +696,8 @@ func runDLinKZG(cfg config) (adapterResult, error) {
 		return adapterResult{}, fmt.Errorf("unexpected constraint system type %T", ccs)
 	}
 
-	// Every rank can construct the public statement. Only party ranks build
-	// and solve the private witness; coordinator rank zero passes no solution
-	// to CompiledProveMPI.
+	// Every rank is a proving party and constructs the same public statement.
+	// Rank zero additionally performs the coordinator role.
 	publicWitness, err := frontend.NewWitness(
 		witnessAssignment,
 		ecc.BN254,
@@ -708,16 +710,13 @@ func runDLinKZG(cfg config) (adapterResult, error) {
 	if !ok {
 		return adapterResult{}, fmt.Errorf("unexpected public witness vector type %T", publicWitness.Vector)
 	}
-	var privateWitnessVector *witnessbn254.Witness
-	if mpi.SelfRank != 0 {
-		fullWitness, witnessErr := frontend.NewWitness(witnessAssignment, ecc.BN254)
-		if witnessErr != nil {
-			return adapterResult{}, fmt.Errorf("build dlinkzg party witness: %w", witnessErr)
-		}
-		privateWitnessVector, ok = fullWitness.Vector.(*witnessbn254.Witness)
-		if !ok {
-			return adapterResult{}, fmt.Errorf("unexpected full witness vector type %T", fullWitness.Vector)
-		}
+	fullWitness, err := frontend.NewWitness(witnessAssignment, ecc.BN254)
+	if err != nil {
+		return adapterResult{}, fmt.Errorf("build dlinkzg party witness: %w", err)
+	}
+	privateWitnessVector, ok := fullWitness.Vector.(*witnessbn254.Witness)
+	if !ok {
+		return adapterResult{}, fmt.Errorf("unexpected full witness vector type %T", fullWitness.Vector)
 	}
 
 	if err := synchronizeWorld(); err != nil {
@@ -780,12 +779,9 @@ func runDLinKZG(cfg config) (adapterResult, error) {
 	proverPrepareElapsed := time.Since(proverPrepareStarted)
 
 	solveStarted := time.Now()
-	var partySolution []fr.Element
-	if mpi.SelfRank != 0 {
-		partySolution, err = spr.Solve([]fr.Element(*privateWitnessVector), proverConfig)
-		if err != nil {
-			return adapterResult{}, fmt.Errorf("dlinkzg party witness solve: %w", err)
-		}
+	partySolution, err := spr.Solve([]fr.Element(*privateWitnessVector), proverConfig)
+	if err != nil {
+		return adapterResult{}, fmt.Errorf("dlinkzg party witness solve: %w", err)
 	}
 	if err := synchronizeWorld(); err != nil {
 		return adapterResult{}, fmt.Errorf("synchronize after dlinkzg witness solve: %w", err)
@@ -875,6 +871,7 @@ func runDLinKZG(cfg config) (adapterResult, error) {
 			"heap_alloc_bytes":              float64(memory.Alloc),
 			"heap_sys_bytes":                float64(memory.HeapSys),
 			"peak_rss_coordinator_bytes":    float64(coordinatorPeakRSS),
+			"peak_rss_rank0_bytes":          float64(coordinatorPeakRSS),
 			"peak_rss_worker_max_bytes":     float64(workerPeakRSS),
 			"peak_rss_rank_sum_bytes":       float64(rankSumPeakRSS),
 			"peak_rss_supported_rank_count": float64(supportedRSSRanks),
@@ -885,7 +882,8 @@ func runDLinKZG(cfg config) (adapterResult, error) {
 			"public_variables":           float64(publicVariables),
 			"partitions":                 float64(cfg.workers),
 			"mpi_world_size":             float64(mpi.WorldSize),
-			"coordinator_only_ranks":     1,
+			"coordinator_only_ranks":     0,
+			"coordinator_embedded_ranks": 1,
 			"local_domain_size":          float64(localDomainSize),
 			"global_padded_rows":         float64(localDomainSize * cfg.workers),
 			"quotient_domain_size":       float64(4 * localDomainSize),

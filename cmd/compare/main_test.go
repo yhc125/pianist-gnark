@@ -38,11 +38,11 @@ func TestValidateConfigTopology(t *testing.T) {
 	}{
 		{"gpiano M2 world2", validTestConfig("gpiano", 2), 2, false},
 		{"gpiano mismatch", validTestConfig("gpiano", 2), 3, true},
-		{"dlinkzg M2 world3", validTestConfig("dlinkzg", 2), 3, false},
-		{"dlinkzg M4 world5", validTestConfig("dlinkzg", 4), 5, false},
-		{"dlinkzg missing coordinator", validTestConfig("dlinkzg", 2), 2, true},
-		{"dlinkzg non power of two", validTestConfig("dlinkzg", 3), 4, true},
-		{"dlinkzg M1", validTestConfig("dlinkzg", 1), 2, true},
+		{"dlinkzg M2 world2", validTestConfig("dlinkzg", 2), 2, false},
+		{"dlinkzg M4 world4", validTestConfig("dlinkzg", 4), 4, false},
+		{"dlinkzg mismatch", validTestConfig("dlinkzg", 2), 3, true},
+		{"dlinkzg non power of two", validTestConfig("dlinkzg", 3), 3, true},
+		{"dlinkzg M1", validTestConfig("dlinkzg", 1), 1, true},
 		{"plonk singleton", validTestConfig("plonk", 1), 1, false},
 		{"plonk distributed", validTestConfig("plonk", 1), 2, true},
 		{"unknown backend", validTestConfig("unknown", 1), 1, true},
@@ -100,7 +100,7 @@ func TestInitializeMPIWorldSingleProcessAndMissingDistributedEnvironment(t *test
 	t.Setenv("PIANIST_MPI_SSH_KEY", "/does/not/exist/key")
 	t.Setenv("PIANIST_MPI_SSH_USER", "nobody")
 	mpi.SelfRank = 0
-	mpi.WorldSize = 3
+	mpi.WorldSize = 2
 	if err := initializeMPIWorld(validTestConfig("dlinkzg", 2)); err != nil {
 		t.Fatalf("reuse initialized root world: %v", err)
 	}
@@ -236,14 +236,14 @@ func TestDLinKZGPublicOnlyWitnessIsSolutionPrefixAndSetupIsFullyValidated(t *tes
 	if err != nil {
 		t.Fatalf("validate and provision root: %v", err)
 	}
-	if rootRole.Coordinator == nil || rootRole.Party != nil || vk.Metadata != setup.Metadata {
+	if rootRole.Coordinator == nil || rootRole.Party == nil || rootRole.Party.Rank != 0 || vk.Metadata != setup.Metadata {
 		t.Fatal("root role provisioning returned the wrong role or VK")
 	}
 	_, partyRole, err := validateAndProvisionDLinKZGSetup(setup, 1)
 	if err != nil {
 		t.Fatalf("validate and provision party: %v", err)
 	}
-	if partyRole.Party == nil || partyRole.Coordinator != nil || partyRole.Party.Rank != 0 {
+	if partyRole.Party == nil || partyRole.Coordinator != nil || partyRole.Party.Rank != 1 {
 		t.Fatal("party role provisioning returned the wrong slot")
 	}
 
@@ -264,8 +264,8 @@ func TestExpectedDLinKZGRootAccountingM2M4(t *testing.T) {
 		framingSent, framingRecv             float64
 		fieldElements, encoded, uncompressed float64
 	}{
-		{2, 4416, 2880, 4776, 3200, 360, 320, 49, 2164, 2740},
-		{4, 9600, 5760, 10320, 6400, 720, 640, 55, 2356, 2932},
+		{2, 2176, 1408, 2356, 1568, 180, 160, 49, 2132, 2676},
+		{4, 7104, 4224, 7644, 4704, 540, 480, 55, 2324, 2868},
 	}
 	for _, test := range tests {
 		payloadSent, payloadRecv, wireSent, wireRecv, err :=
@@ -281,7 +281,7 @@ func TestExpectedDLinKZGRootAccountingM2M4(t *testing.T) {
 			)
 		}
 		accounting := dlinkzgbackend.ProtocolMPIAccounting{
-			Rank: 0, WorldSize: test.partitions + 1,
+			Rank: 0, WorldSize: test.partitions,
 			PartitionCount: test.partitions, Operations: dlinkzgProtocolOperations,
 			Total: dlinkzgbackend.ProtocolMPIPhaseAccounting{
 				PayloadBytesSent: payloadSent, PayloadBytesRecv: payloadRecv,
@@ -303,7 +303,7 @@ func TestExpectedDLinKZGRootAccountingM2M4(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if artifacts["proof_g1_elements"] != 18 ||
+		if artifacts["proof_g1_elements"] != 17 ||
 			artifacts["proof_field_elements"] != test.fieldElements ||
 			artifacts["proof_bytes"] != test.encoded ||
 			artifacts["proof_bytes_uncompressed"] != test.uncompressed ||
@@ -325,7 +325,7 @@ func TestDLinKZGCommunicationMetricsRejectsNoncanonicalLedger(t *testing.T) {
 		t.Fatal(err)
 	}
 	accounting := dlinkzgbackend.ProtocolMPIAccounting{
-		Rank: 0, WorldSize: 3, PartitionCount: 2, Operations: dlinkzgProtocolOperations,
+		Rank: 0, WorldSize: 2, PartitionCount: 2, Operations: dlinkzgProtocolOperations,
 		Total: dlinkzgbackend.ProtocolMPIPhaseAccounting{
 			PayloadBytesSent: payloadSent, PayloadBytesRecv: payloadRecv,
 			WireBytesSent: wireSent, WireBytesRecv: wireRecv,

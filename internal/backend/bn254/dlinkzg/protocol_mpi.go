@@ -14,8 +14,6 @@ import (
 	"math/bits"
 	"sync"
 
-	"github.com/consensys/gnark-crypto/ecc/bn254"
-	"github.com/consensys/gnark-crypto/ecc/bn254/fr"
 	"github.com/sunblaze-ucb/simpleMPI/mpi"
 )
 
@@ -127,7 +125,8 @@ type ProtocolMPIPhaseAccounting struct {
 }
 
 // ProtocolMPIAccounting is one process's immutable communication snapshot.
-// WorldSize is M+1 and PartitionCount is M.
+// WorldSize and PartitionCount are both M. Rank zero is party slot zero and
+// also executes the coordinator role.
 type ProtocolMPIAccounting struct {
 	Rank           uint64                        `json:"rank"`
 	WorldSize      uint64                        `json:"mpi_world_size"`
@@ -172,13 +171,13 @@ func newProtocolMPIChannel(transport mpiByteTransport) (*ProtocolMPIChannel, err
 		return nil, fmt.Errorf("%w: nil transport", ErrProtocolMPIConfiguration)
 	}
 	rank, worldSize := transport.Rank(), transport.Size()
-	if worldSize < 3 || rank >= worldSize {
+	if worldSize < 2 || rank >= worldSize {
 		return nil, fmt.Errorf(
 			"%w: rank %d in world size %d",
 			ErrProtocolMPIConfiguration, rank, worldSize,
 		)
 	}
-	partitions := worldSize - 1
+	partitions := worldSize
 	if partitions < 2 || partitions&(partitions-1) != 0 {
 		return nil, fmt.Errorf(
 			"%w: world size %d gives non-power-of-two partition count %d",
@@ -202,26 +201,24 @@ func newProtocolMPIChannel(transport mpiByteTransport) (*ProtocolMPIChannel, err
 // Rank returns the MPI rank. Rank zero is the coordinator.
 func (channel *ProtocolMPIChannel) Rank() uint64 { return channel.rank }
 
-// WorldSize returns M+1: the coordinator plus M parties.
+// WorldSize returns M: every MPI rank is a party and rank zero also coordinates.
 func (channel *ProtocolMPIChannel) WorldSize() uint64 { return channel.worldSize }
 
 // IsCoordinator reports whether this process is coordinator rank zero.
 func (channel *ProtocolMPIChannel) IsCoordinator() bool { return channel.rank == 0 }
 
-// PartitionCount returns M, excluding coordinator rank zero.
+// PartitionCount returns M, including party slot zero on coordinator rank zero.
 func (channel *ProtocolMPIChannel) PartitionCount() uint64 { return channel.partitions }
 
-// PartySlot maps MPI rank r in [1,M] to canonical party slot r-1.
+// PartySlot maps MPI rank r in [0,M) to canonical party slot r.
 func (channel *ProtocolMPIChannel) PartySlot() (uint64, bool) {
-	if channel.IsCoordinator() {
-		return 0, false
-	}
-	return channel.rank - 1, true
+	return channel.rank, true
 }
 
 // AggregateWorkers adds one fixed-shape share from every party. The
-// coordinator supplies an empty workerShare and contributes no additive share.
-// Only the coordinator receives the sum; parties receive an empty payload.
+// coordinator supplies party zero's local share directly, without loopback
+// network traffic. Only the coordinator receives the sum; other parties
+// receive an empty payload.
 func (channel *ProtocolMPIChannel) AggregateWorkers(
 	phase ProtocolMPIPhase,
 	shape MPIPayloadShape,
@@ -250,13 +247,10 @@ func (channel *ProtocolMPIChannel) AggregateWorkers(
 		return MPIPayload{}, nil
 	}
 
-	if !emptyMPIPayload(workerShare) {
-		return MPIPayload{}, fmt.Errorf("%w: coordinator supplied an aggregate share", ErrMPIPayload)
+	if workerShare.Shape() != shape {
+		return MPIPayload{}, protocolPayloadShapeError("root local aggregate share", workerShare.Shape(), shape)
 	}
-	result := MPIPayload{
-		Fields: make([]fr.Element, shape.Fields),
-		G1:     make([]bn254.G1Affine, shape.G1),
-	}
+	result := workerShare.clone()
 	for rank := uint64(1); rank < channel.worldSize; rank++ {
 		if err := channel.receiveExpectedHeader(rank, header); err != nil {
 			return MPIPayload{}, fmt.Errorf("%w: aggregate header from rank %d: %v", ErrProtocolMPIRecord, rank, err)
@@ -272,8 +266,8 @@ func (channel *ProtocolMPIChannel) AggregateWorkers(
 }
 
 // GatherWorkers receives one record from every party without combining it.
-// On the coordinator, result[slot] is the record sent by MPI rank slot+1,
-// independent of arrival order. Parties return nil.
+// On the coordinator, result[0] is its local party-zero record and result[r]
+// is the record sent by MPI rank r. Other parties return nil.
 func (channel *ProtocolMPIChannel) GatherWorkers(
 	phase ProtocolMPIPhase,
 	shape MPIPayloadShape,
@@ -302,10 +296,11 @@ func (channel *ProtocolMPIChannel) GatherWorkers(
 		return nil, nil
 	}
 
-	if !emptyMPIPayload(workerPayload) {
-		return nil, fmt.Errorf("%w: coordinator supplied a gather record", ErrMPIPayload)
+	if workerPayload.Shape() != shape {
+		return nil, protocolPayloadShapeError("root local gather record", workerPayload.Shape(), shape)
 	}
 	result := make([]MPIPayload, channel.partitions)
+	result[0] = workerPayload.clone()
 	for rank := uint64(1); rank < channel.worldSize; rank++ {
 		if err := channel.receiveExpectedHeader(rank, header); err != nil {
 			return nil, fmt.Errorf("%w: gather header from rank %d: %v", ErrProtocolMPIRecord, rank, err)
@@ -314,15 +309,15 @@ func (channel *ProtocolMPIChannel) GatherWorkers(
 		if err != nil {
 			return nil, fmt.Errorf("dlinkzg: protocol gather payload from rank %d: %w", rank, err)
 		}
-		result[rank-1] = record
+		result[rank] = record
 	}
 	channel.finishOperation(phase, protocolMPIOpGather)
 	return result, nil
 }
 
 // RootScatter sends exactly one fixed-shape payload to each party. The
-// coordinator supplies M payloads ordered by party slot. Party rank r receives
-// only rootPayloads[r-1]. The coordinator receives an empty payload.
+// coordinator supplies M payloads ordered by party slot. Rank zero receives
+// rootPayloads[0] locally and party rank r receives rootPayloads[r].
 func (channel *ProtocolMPIChannel) RootScatter(
 	phase ProtocolMPIPhase,
 	shape MPIPayloadShape,
@@ -357,12 +352,12 @@ func (channel *ProtocolMPIChannel) RootScatter(
 			if err := channel.sendHeader(rank, header); err != nil {
 				return MPIPayload{}, fmt.Errorf("dlinkzg: protocol scatter header to rank %d: %w", rank, err)
 			}
-			if err := channel.sendPayload(phase, rank, encoded[rank-1]); err != nil {
+			if err := channel.sendPayload(phase, rank, encoded[rank]); err != nil {
 				return MPIPayload{}, fmt.Errorf("dlinkzg: protocol scatter payload to rank %d: %w", rank, err)
 			}
 		}
 		channel.finishOperation(phase, protocolMPIOpScatter)
-		return MPIPayload{}, nil
+		return rootPayloads[0].clone(), nil
 	}
 
 	if len(rootPayloads) != 0 {
@@ -568,10 +563,10 @@ func protocolMPIExpectedShape(
 		}
 	case ProtocolMPIPhaseU3:
 		if operation == protocolMPIOpAggregate {
-			return MPIPayloadShape{G1: 3}, nil
+			return MPIPayloadShape{G1: 2}, nil
 		}
 		if operation == protocolMPIOpBroadcast {
-			return MPIPayloadShape{G1: 4}, nil
+			return MPIPayloadShape{G1: 3}, nil
 		}
 	}
 	return MPIPayloadShape{}, fmt.Errorf(

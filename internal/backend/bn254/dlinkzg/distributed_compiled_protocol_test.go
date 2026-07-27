@@ -29,16 +29,18 @@ func TestCompiledProveMPIEqualsCentralProofM2M4(t *testing.T) {
 				t.Fatalf("marshal central proof: %v", err)
 			}
 
-			worldSize := uint64(partitions + 1)
+			worldSize := uint64(partitions)
 			network := newFakeMPINetwork(worldSize)
 			channels := make([]*ProtocolMPIChannel, worldSize)
 			roles := make([]CompiledMPIRole, worldSize)
 			solutions := make([][]fr.Element, worldSize)
 			coordinator := fixture.setup.Coordinator
-			roles[0] = CompiledMPIRole{Coordinator: &coordinator}
-			for rank := uint64(1); rank < worldSize; rank++ {
-				party := fixture.setup.Parties[rank-1]
+			for rank := uint64(0); rank < worldSize; rank++ {
+				party := fixture.setup.Parties[rank]
 				roles[rank] = CompiledMPIRole{Party: &party}
+				if rank == 0 {
+					roles[rank].Coordinator = &coordinator
+				}
 				solutions[rank] = append([]fr.Element(nil), fixture.solution...)
 			}
 			// The goroutines receive only their extracted role. Removing the
@@ -111,8 +113,8 @@ func TestCompiledProveMPIEqualsCentralProofM2M4(t *testing.T) {
 
 			logM := bitsForCompiledProtocol(partitions)
 			root := results[0].accounting.Total
-			wantRootReceive := uint64(partitions * 1440)
-			wantRootSend := uint64(partitions * (2016 + 192*logM))
+			wantRootReceive := uint64((partitions - 1) * 1408)
+			wantRootSend := uint64((partitions - 1) * (1984 + 192*logM))
 			if root.PayloadBytesRecv != wantRootReceive || root.PayloadBytesSent != wantRootSend {
 				t.Fatalf(
 					"root payload bytes recv/send = %d/%d, want %d/%d",
@@ -123,9 +125,9 @@ func TestCompiledProveMPIEqualsCentralProofM2M4(t *testing.T) {
 	}
 }
 
-func TestCompiledMPIRoleValidationIsExclusiveAndRankLocal(t *testing.T) {
+func TestCompiledMPIRoleValidationIsCompositeAndRankLocal(t *testing.T) {
 	fixture := newCompiledProtocolTestFixture(t, 2, 111)
-	network := newFakeMPINetwork(3)
+	network := newFakeMPINetwork(2)
 	root, err := newProtocolMPIChannel(network.transport(0))
 	if err != nil {
 		t.Fatal(err)
@@ -144,13 +146,14 @@ func TestCompiledMPIRoleValidationIsExclusiveAndRankLocal(t *testing.T) {
 		role     CompiledMPIRole
 		solution []fr.Element
 	}{
-		{"root missing coordinator", root, CompiledMPIRole{}, nil},
-		{"root also owns party", root, CompiledMPIRole{Coordinator: &coordinator, Party: &party0}, nil},
-		{"root owns solution", root, CompiledMPIRole{Coordinator: &coordinator}, fixture.solution},
+		{"root missing coordinator", root, CompiledMPIRole{Party: &party0}, fixture.solution},
+		{"root missing party", root, CompiledMPIRole{Coordinator: &coordinator}, nil},
+		{"root missing solution", root, CompiledMPIRole{Coordinator: &coordinator, Party: &party0}, nil},
+		{"root wrong party slot", root, CompiledMPIRole{Coordinator: &coordinator, Party: &party1}, fixture.solution},
 		{"party missing role", partyOne, CompiledMPIRole{}, fixture.solution},
-		{"party also owns coordinator", partyOne, CompiledMPIRole{Party: &party0, Coordinator: &coordinator}, fixture.solution},
-		{"wrong party slot", partyOne, CompiledMPIRole{Party: &party1}, fixture.solution},
-		{"party missing solution", partyOne, CompiledMPIRole{Party: &party0}, nil},
+		{"party also owns coordinator", partyOne, CompiledMPIRole{Party: &party1, Coordinator: &coordinator}, fixture.solution},
+		{"wrong party slot", partyOne, CompiledMPIRole{Party: &party0}, fixture.solution},
+		{"party missing solution", partyOne, CompiledMPIRole{Party: &party1}, nil},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
@@ -164,13 +167,13 @@ func TestCompiledMPIRoleValidationIsExclusiveAndRankLocal(t *testing.T) {
 
 	if err := validateCompiledMPIRole(
 		root, fixture.vk, fixture.statement,
-		CompiledMPIRole{Coordinator: &coordinator}, nil,
+		CompiledMPIRole{Coordinator: &coordinator, Party: &party0}, fixture.solution,
 	); err != nil {
-		t.Fatalf("valid coordinator role: %v", err)
+		t.Fatalf("valid composite root role: %v", err)
 	}
 	if err := validateCompiledMPIRole(
 		partyOne, fixture.vk, fixture.statement,
-		CompiledMPIRole{Party: &party0}, fixture.solution,
+		CompiledMPIRole{Party: &party1}, fixture.solution,
 	); err != nil {
 		t.Fatalf("valid party role: %v", err)
 	}
@@ -192,7 +195,7 @@ func TestCompiledMPIRoleTypeContainsNoFullSetup(t *testing.T) {
 
 func TestProvisionCompiledMPIRoleExtractsOnlyAssignedRank(t *testing.T) {
 	fixture := newCompiledProtocolTestFixture(t, 4, 121)
-	for rank := uint64(0); rank < 5; rank++ {
+	for rank := uint64(0); rank < 4; rank++ {
 		vk, role, err := ProvisionCompiledMPIRole(fixture.setup, rank)
 		if err != nil {
 			t.Fatalf("rank %d provision: %v", rank, err)
@@ -200,18 +203,21 @@ func TestProvisionCompiledMPIRoleExtractsOnlyAssignedRank(t *testing.T) {
 		if vk.Metadata != fixture.vk.Metadata {
 			t.Fatalf("rank %d received different VK metadata", rank)
 		}
+		if role.Party == nil || role.Party.Rank != int(rank) ||
+			role.Party == &fixture.setup.Parties[rank] {
+			t.Fatalf("rank %d party role was not the isolated slot copy", rank)
+		}
 		if rank == 0 {
-			if role.Coordinator == nil || role.Party != nil || role.Coordinator == &fixture.setup.Coordinator {
+			if role.Coordinator == nil || role.Coordinator == &fixture.setup.Coordinator {
 				t.Fatal("coordinator role was not an isolated value copy")
 			}
 		} else {
-			if role.Party == nil || role.Coordinator != nil || role.Party.Rank != int(rank-1) ||
-				role.Party == &fixture.setup.Parties[rank-1] {
+			if role.Coordinator != nil {
 				t.Fatalf("rank %d party role was not the isolated slot copy", rank)
 			}
 		}
 	}
-	if _, _, err := ProvisionCompiledMPIRole(fixture.setup, 5); !errors.Is(err, ErrInvalidCompiledMPIRole) {
+	if _, _, err := ProvisionCompiledMPIRole(fixture.setup, 4); !errors.Is(err, ErrInvalidCompiledMPIRole) {
 		t.Fatalf("out-of-range rank error = %v", err)
 	}
 	if _, _, err := ProvisionCompiledMPIRole(nil, 0); err == nil {

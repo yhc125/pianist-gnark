@@ -13,9 +13,9 @@ import (
 
 const (
 	compiledProofMagic        = "DLKZGPRF"
-	compiledProofVersion      = uint16(1)
+	compiledProofVersion      = uint16(2)
 	compiledProofHeaderSize   = 20
-	compiledProofG1Count      = 18
+	compiledProofG1Count      = 17
 	compiledProofFixedFrCount = 43
 )
 
@@ -33,7 +33,7 @@ var (
 // therefore are not serialized. Retained W3 records, clear party tables, and
 // all prover-only state are likewise absent.
 //
-// For M partitions it contains exactly 18 compressed G1 elements and
+// For M partitions it contains exactly 17 compressed G1 elements and
 // 6*log2(M)+43 scalar-field elements.
 type CompiledProof struct {
 	W0               OuterW0Message
@@ -133,8 +133,7 @@ func (proof *CompiledProof) MarshalBinary(partitions uint64) ([]byte, error) {
 		encoded = appendCompiledProofField(encoded, &proof.U2.BatchAtBeta[i])
 		encoded = appendCompiledProofField(encoded, &proof.U2.BatchAtBetaInverse[i])
 	}
-	encoded = appendCompiledProofG1(encoded, &proof.U3.WG)
-	encoded = appendCompiledProofG1(encoded, &proof.U3.WL)
+	encoded = appendCompiledProofG1(encoded, &proof.U3.WN)
 	encoded = appendCompiledProofG1(encoded, &proof.U3.PiZ)
 	encoded = appendCompiledProofG1(encoded, &proof.U3.PiY)
 
@@ -241,16 +240,13 @@ func DecodeCompiledProof(encoded []byte, partitions uint64) (*CompiledProof, err
 			return nil, err
 		}
 	}
-	if err := decoder.g1(&proof.U3.WG, "U3", 0); err != nil {
+	if err := decoder.g1(&proof.U3.WN, "U3", 0); err != nil {
 		return nil, err
 	}
-	if err := decoder.g1(&proof.U3.WL, "U3", 1); err != nil {
+	if err := decoder.g1(&proof.U3.PiZ, "U3", 1); err != nil {
 		return nil, err
 	}
-	if err := decoder.g1(&proof.U3.PiZ, "U3", 2); err != nil {
-		return nil, err
-	}
-	if err := decoder.g1(&proof.U3.PiY, "U3", 3); err != nil {
+	if err := decoder.g1(&proof.U3.PiY, "U3", 2); err != nil {
 		return nil, err
 	}
 	if decoder.offset != len(encoded) {
@@ -328,8 +324,7 @@ func validateCompiledProof(proof *CompiledProof) error {
 	}{
 		{"U1.link", &proof.U1.LinkCommitment},
 		{"U1.Laurent", &proof.U1.LaurentCommitment},
-		{"U3.WG", &proof.U3.WG},
-		{"U3.WL", &proof.U3.WL},
+		{"U3.WN", &proof.U3.WN},
 		{"U3.PiZ", &proof.U3.PiZ},
 		{"U3.PiY", &proof.U3.PiY},
 	}

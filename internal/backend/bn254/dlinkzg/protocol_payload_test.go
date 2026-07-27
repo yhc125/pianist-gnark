@@ -158,27 +158,27 @@ func TestProtocolPayloadFixedRecordsRoundTripInSemanticOrder(t *testing.T) {
 
 	t.Run("U3 aggregate and broadcast", func(t *testing.T) {
 		aggregate := ProtocolU3AggregateRecord{
-			WG: protocolPayloadTestPoint(90), WL: protocolPayloadTestPoint(91), PiZ: protocolPayloadTestPoint(92),
+			WN: protocolPayloadTestPoint(90), PiZ: protocolPayloadTestPoint(92),
 		}
 		payload, err := PackProtocolU3Aggregate(aggregate)
 		protocolPayloadTestNoError(t, err)
-		protocolPayloadTestPointOrder(t, payload.G1, []bn254.G1Affine{aggregate.WG, aggregate.WL, aggregate.PiZ})
+		protocolPayloadTestPointOrder(t, payload.G1, []bn254.G1Affine{aggregate.WN, aggregate.PiZ})
 		decodedAggregate, err := UnpackProtocolU3Aggregate(payload)
 		protocolPayloadTestNoError(t, err)
 		protocolPayloadTestPointOrder(t,
-			[]bn254.G1Affine{decodedAggregate.WG, decodedAggregate.WL, decodedAggregate.PiZ}, payload.G1,
+			[]bn254.G1Affine{decodedAggregate.WN, decodedAggregate.PiZ}, payload.G1,
 		)
 
-		broadcast := U3Message{WG: aggregate.WG, WL: aggregate.WL, PiZ: aggregate.PiZ, PiY: protocolPayloadTestPoint(93)}
+		broadcast := U3Message{WN: aggregate.WN, PiZ: aggregate.PiZ, PiY: protocolPayloadTestPoint(93)}
 		payload, err = PackProtocolU3Broadcast(broadcast)
 		protocolPayloadTestNoError(t, err)
 		protocolPayloadTestPointOrder(t, payload.G1,
-			[]bn254.G1Affine{broadcast.WG, broadcast.WL, broadcast.PiZ, broadcast.PiY},
+			[]bn254.G1Affine{broadcast.WN, broadcast.PiZ, broadcast.PiY},
 		)
 		decodedBroadcast, err := UnpackProtocolU3Broadcast(payload)
 		protocolPayloadTestNoError(t, err)
 		protocolPayloadTestPointOrder(t,
-			[]bn254.G1Affine{decodedBroadcast.WG, decodedBroadcast.WL, decodedBroadcast.PiZ, decodedBroadcast.PiY},
+			[]bn254.G1Affine{decodedBroadcast.WN, decodedBroadcast.PiZ, decodedBroadcast.PiY},
 			payload.G1,
 		)
 	})
@@ -216,12 +216,11 @@ func TestProtocolPayloadPackShapesMatchAllSeventeenOperations(t *testing.T) {
 	u2Broadcast, err := PackProtocolU2Broadcast(U2Message{})
 	protocolPayloadTestNoError(t, err)
 	u3Aggregate, err := PackProtocolU3Aggregate(ProtocolU3AggregateRecord{
-		WG: protocolPayloadTestPoint(16), WL: protocolPayloadTestPoint(17), PiZ: protocolPayloadTestPoint(18),
+		WN: protocolPayloadTestPoint(16), PiZ: protocolPayloadTestPoint(18),
 	})
 	protocolPayloadTestNoError(t, err)
 	u3Broadcast, err := PackProtocolU3Broadcast(U3Message{
-		WG: protocolPayloadTestPoint(19), WL: protocolPayloadTestPoint(20),
-		PiZ: protocolPayloadTestPoint(21), PiY: protocolPayloadTestPoint(22),
+		WN: protocolPayloadTestPoint(19), PiZ: protocolPayloadTestPoint(21), PiY: protocolPayloadTestPoint(22),
 	})
 	protocolPayloadTestNoError(t, err)
 
@@ -337,8 +336,8 @@ func TestProtocolPayloadRejectsWrongShapesAndInvalidValues(t *testing.T) {
 		{"U1 broadcast", func(p MPIPayload) error { _, err := UnpackProtocolU1Broadcast(p); return err }, MPIPayload{Fields: make([]fr.Element, 3), G1: make([]bn254.G1Affine, 2)}},
 		{"U2 aggregate", func(p MPIPayload) error { _, err := UnpackProtocolU2Aggregate(p); return err }, MPIPayload{Fields: make([]fr.Element, 7)}},
 		{"U2 broadcast", func(p MPIPayload) error { _, err := UnpackProtocolU2Broadcast(p); return err }, MPIPayload{Fields: make([]fr.Element, 14)}},
-		{"U3 aggregate", func(p MPIPayload) error { _, err := UnpackProtocolU3Aggregate(p); return err }, MPIPayload{G1: make([]bn254.G1Affine, 3)}},
-		{"U3 broadcast", func(p MPIPayload) error { _, err := UnpackProtocolU3Broadcast(p); return err }, MPIPayload{G1: make([]bn254.G1Affine, 4)}},
+		{"U3 aggregate", func(p MPIPayload) error { _, err := UnpackProtocolU3Aggregate(p); return err }, MPIPayload{G1: make([]bn254.G1Affine, 2)}},
+		{"U3 broadcast", func(p MPIPayload) error { _, err := UnpackProtocolU3Broadcast(p); return err }, MPIPayload{G1: make([]bn254.G1Affine, 3)}},
 	}
 	for _, test := range tests {
 		t.Run(test.name+" fields", func(t *testing.T) {
