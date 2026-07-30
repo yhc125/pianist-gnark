@@ -3,11 +3,96 @@ package dlinkzg
 import (
 	"errors"
 	"math/big"
+	"reflect"
 	"testing"
 
 	"github.com/consensys/gnark-crypto/ecc/bn254"
 	"github.com/consensys/gnark-crypto/ecc/bn254/fr"
 )
+
+func TestHybridProtocolPayloadRoundTrips(t *testing.T) {
+	u0 := HybridU0Message{PartialCommitments: protocolPayloadTestPoints3(301)}
+	payload, err := PackHybridProtocolU0(u0)
+	protocolPayloadTestNoError(t, err)
+	decodedU0, err := UnpackHybridProtocolU0(payload)
+	protocolPayloadTestNoError(t, err)
+	if !reflect.DeepEqual(decodedU0, u0) {
+		t.Fatal("hybrid U0 round trip")
+	}
+
+	u1Gather := HybridProtocolU1GatherRecord{
+		A:                 [3]fr.Element{fr.NewElement(311), fr.NewElement(312), fr.NewElement(313)},
+		LaurentCommitment: protocolPayloadTestPoint(314),
+	}
+	payload, err = PackHybridProtocolU1Gather(u1Gather)
+	protocolPayloadTestNoError(t, err)
+	decodedU1Gather, err := UnpackHybridProtocolU1Gather(payload)
+	protocolPayloadTestNoError(t, err)
+	if !reflect.DeepEqual(decodedU1Gather, u1Gather) {
+		t.Fatal("hybrid U1 gather round trip")
+	}
+
+	u1 := HybridU1Message{
+		PartialAtChallenge:   [3]fr.Element{fr.NewElement(321), fr.NewElement(322), fr.NewElement(323)},
+		FunctionalCommitment: protocolPayloadTestPoint(324), LaurentCommitment: protocolPayloadTestPoint(325),
+	}
+	payload, err = PackHybridProtocolU1Broadcast(u1)
+	protocolPayloadTestNoError(t, err)
+	decodedU1, err := UnpackHybridProtocolU1Broadcast(payload)
+	protocolPayloadTestNoError(t, err)
+	if !reflect.DeepEqual(decodedU1, u1) {
+		t.Fatal("hybrid U1 broadcast round trip")
+	}
+
+	u2Aggregate := HybridProtocolU2AggregateRecord{CircuitCrossValues: [3][2]fr.Element{
+		{fr.NewElement(331), fr.NewElement(332)},
+		{fr.NewElement(333), fr.NewElement(334)},
+		{fr.NewElement(335), fr.NewElement(336)},
+	}}
+	payload, err = PackHybridProtocolU2Aggregate(u2Aggregate)
+	protocolPayloadTestNoError(t, err)
+	decodedU2Aggregate, err := UnpackHybridProtocolU2Aggregate(payload)
+	protocolPayloadTestNoError(t, err)
+	if !reflect.DeepEqual(decodedU2Aggregate, u2Aggregate) {
+		t.Fatal("hybrid U2 aggregate round trip")
+	}
+
+	u2 := HybridU2Message{CircuitCrossValues: u2Aggregate.CircuitCrossValues}
+	for index := range u2.LaurentAtBeta {
+		u2.LaurentAtBeta[index] = fr.NewElement(uint64(341 + index))
+		u2.LaurentAtBetaInverse[index] = fr.NewElement(uint64(351 + index))
+	}
+	payload, err = PackHybridProtocolU2Broadcast(u2)
+	protocolPayloadTestNoError(t, err)
+	decodedU2, err := UnpackHybridProtocolU2Broadcast(payload)
+	protocolPayloadTestNoError(t, err)
+	if !reflect.DeepEqual(decodedU2, u2) {
+		t.Fatal("hybrid U2 broadcast round trip")
+	}
+
+	u3Aggregate := HybridProtocolU3AggregateRecord{
+		WCirc: protocolPayloadTestPoint(361), WLaur: protocolPayloadTestPoint(362), PiU: protocolPayloadTestPoint(363),
+	}
+	payload, err = PackHybridProtocolU3Aggregate(u3Aggregate)
+	protocolPayloadTestNoError(t, err)
+	decodedU3Aggregate, err := UnpackHybridProtocolU3Aggregate(payload)
+	protocolPayloadTestNoError(t, err)
+	if !reflect.DeepEqual(decodedU3Aggregate, u3Aggregate) {
+		t.Fatal("hybrid U3 aggregate round trip")
+	}
+
+	u3 := HybridU3Message{
+		WCirc: u3Aggregate.WCirc, WLaur: u3Aggregate.WLaur, PiU: u3Aggregate.PiU,
+		PiV: protocolPayloadTestPoint(364),
+	}
+	payload, err = PackHybridProtocolU3Broadcast(u3)
+	protocolPayloadTestNoError(t, err)
+	decodedU3, err := UnpackHybridProtocolU3Broadcast(payload)
+	protocolPayloadTestNoError(t, err)
+	if !reflect.DeepEqual(decodedU3, u3) {
+		t.Fatal("hybrid U3 broadcast round trip")
+	}
+}
 
 func TestProtocolPayloadFixedRecordsRoundTripInSemanticOrder(t *testing.T) {
 	t.Run("W0", func(t *testing.T) {
@@ -203,24 +288,24 @@ func TestProtocolPayloadPackShapesMatchAllSeventeenOperations(t *testing.T) {
 		SumCheckRounds: make([]OuterSumCheckRoundMessage, 2),
 	}, partitions)
 	protocolPayloadTestNoError(t, err)
-	u0, err := PackProtocolU0(U0Message{PartialCommitments: protocolPayloadTestPoints3(10)})
+	u0, err := PackHybridProtocolU0(HybridU0Message{PartialCommitments: protocolPayloadTestPoints3(10)})
 	protocolPayloadTestNoError(t, err)
-	u1Gather, err := PackProtocolU1Gather(ProtocolU1GatherRecord{LaurentCommitment: protocolPayloadTestPoint(13)})
+	u1Gather, err := PackHybridProtocolU1Gather(HybridProtocolU1GatherRecord{LaurentCommitment: protocolPayloadTestPoint(13)})
 	protocolPayloadTestNoError(t, err)
-	u1Broadcast, err := PackProtocolU1Broadcast(U1Message{
-		LinkCommitment: protocolPayloadTestPoint(14), LaurentCommitment: protocolPayloadTestPoint(15),
+	u1Broadcast, err := PackHybridProtocolU1Broadcast(HybridU1Message{
+		FunctionalCommitment: protocolPayloadTestPoint(14), LaurentCommitment: protocolPayloadTestPoint(15),
 	})
 	protocolPayloadTestNoError(t, err)
-	u2Aggregate, err := PackProtocolU2Aggregate(ProtocolU2AggregateRecord{})
+	u2Aggregate, err := PackHybridProtocolU2Aggregate(HybridProtocolU2AggregateRecord{})
 	protocolPayloadTestNoError(t, err)
-	u2Broadcast, err := PackProtocolU2Broadcast(U2Message{})
+	u2Broadcast, err := PackHybridProtocolU2Broadcast(HybridU2Message{})
 	protocolPayloadTestNoError(t, err)
-	u3Aggregate, err := PackProtocolU3Aggregate(ProtocolU3AggregateRecord{
-		WN: protocolPayloadTestPoint(16), PiZ: protocolPayloadTestPoint(18),
+	u3Aggregate, err := PackHybridProtocolU3Aggregate(HybridProtocolU3AggregateRecord{
+		WCirc: protocolPayloadTestPoint(16), WLaur: protocolPayloadTestPoint(17), PiU: protocolPayloadTestPoint(18),
 	})
 	protocolPayloadTestNoError(t, err)
-	u3Broadcast, err := PackProtocolU3Broadcast(U3Message{
-		WN: protocolPayloadTestPoint(19), PiZ: protocolPayloadTestPoint(21), PiY: protocolPayloadTestPoint(22),
+	u3Broadcast, err := PackHybridProtocolU3Broadcast(HybridU3Message{
+		WCirc: protocolPayloadTestPoint(19), WLaur: protocolPayloadTestPoint(20), PiU: protocolPayloadTestPoint(21), PiV: protocolPayloadTestPoint(22),
 	})
 	protocolPayloadTestNoError(t, err)
 

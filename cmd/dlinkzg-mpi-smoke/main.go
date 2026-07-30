@@ -28,8 +28,15 @@ func initializeWorld() {
 	ipFile := os.Getenv("PIANIST_MPI_IP_FILE")
 	sshKey := os.Getenv("PIANIST_MPI_SSH_KEY")
 	sshUser := os.Getenv("PIANIST_MPI_SSH_USER")
-	if ipFile == "" || sshKey == "" || sshUser == "" {
-		fmt.Fprintln(os.Stderr, "dlinkzg MPI smoke needs all PIANIST_MPI_* variables")
+	localLauncher := strings.EqualFold(
+		strings.TrimSpace(os.Getenv("SIMPLEMPI_LAUNCH_MODE")),
+		"local",
+	)
+	if ipFile == "" || (!localLauncher && (sshKey == "" || sshUser == "")) {
+		fmt.Fprintln(
+			os.Stderr,
+			"dlinkzg MPI smoke needs PIANIST_MPI_IP_FILE and SSH credentials unless using the local launcher",
+		)
 		os.Exit(2)
 	}
 	mpi.WorldInit(ipFile, sshKey, sshUser)

@@ -124,11 +124,9 @@ type compiledMPIOuterSuffix struct {
 }
 
 type compiledMPIOpeningPartyState struct {
-	local               dlinkzgOpeningLocalState
-	localCircuitClaims  [dlinkzgOpeningCircuitClaims]fr.Element
-	localTarget         fr.Element
-	localSAtBeta        fr.Element
-	localSAtBetaInverse fr.Element
+	local              hybridOpeningLocalState
+	sources            [dlinkzgOpeningCircuitClaims][]fr.Element
+	localCircuitClaims [dlinkzgOpeningCircuitClaims]fr.Element
 }
 
 // ProvisionCompiledMPIRole extracts one value-copied online role from a setup
@@ -617,24 +615,25 @@ func compiledProveMPIWithTraceValidatedProfiled(
 			sourceValues[group] = compression.Values[group]
 		}
 	}
-	openingTranscript, err := NewOpeningTranscript(openingInstance.TranscriptContext)
+	openingTranscript, err := NewHybridOpeningTranscript(openingInstance.TranscriptContext)
 	if err != nil {
 		return nil, trace, compiledMPIError("opening transcript", err)
 	}
 
-	// U0: weighted translated local source commitments.
+	// U0: weighted local source commitments in the semantic U direction. The
+	// degree-aware hybrid deliberately performs no Taylor translation here.
 	phaseStarted = time.Now()
 	var openingPartyState compiledMPIOpeningPartyState
 	u0Share := MPIPayload{}
 	if role.Party != nil {
-		var share U0Message
+		var share HybridU0Message
 		openingPartyState, share, err = compiledMPIOpeningU0Share(
 			role.Party, sources, sourceValues, openingInstance, prepared,
 		)
 		if err != nil {
 			return nil, trace, compiledMPIError("U0 local", err)
 		}
-		u0Share, err = PackProtocolU0(share)
+		u0Share, err = PackHybridProtocolU0(share)
 		if err != nil {
 			return nil, trace, compiledMPIError("U0 payload", err)
 		}
@@ -648,9 +647,9 @@ func compiledProveMPIWithTraceValidatedProfiled(
 	}
 	u0RootPayload := MPIPayload{}
 	if isRoot {
-		publicProof.U0, err = UnpackProtocolU0(u0Aggregate)
+		publicProof.U0, err = UnpackHybridProtocolU0(u0Aggregate)
 		if err == nil {
-			u0RootPayload, err = PackProtocolU0(publicProof.U0)
+			u0RootPayload, err = PackHybridProtocolU0(publicProof.U0)
 		}
 		if err != nil {
 			return nil, trace, compiledMPIError("U0 root assembly", err)
@@ -663,41 +662,37 @@ func compiledProveMPIWithTraceValidatedProfiled(
 	if err != nil {
 		return nil, trace, compiledMPIError("U0 broadcast", err)
 	}
-	publicProof.U0, err = UnpackProtocolU0(u0PublicPayload)
+	publicProof.U0, err = UnpackHybridProtocolU0(u0PublicPayload)
 	if err != nil {
 		return nil, trace, compiledMPIError("U0 decode", err)
 	}
 	if err := openingTranscript.AppendU0(publicProof.U0); err != nil {
 		return nil, trace, compiledMPIError("U0 transcript", err)
 	}
-	xiOut, err := openingTranscript.DeriveXi()
+	gammaOut, err := openingTranscript.DeriveGamma()
 	if err != nil {
-		return nil, trace, compiledMPIError("xi", err)
+		return nil, trace, compiledMPIError("gamma", err)
 	}
-	nuOut, err := openingTranscript.DeriveNu()
+	alphaChallengeOut, err := openingTranscript.DeriveAlphaChallenge(openingInstance.SemanticQueryPoints)
 	if err != nil {
-		return nil, trace, compiledMPIError("nu", err)
+		return nil, trace, compiledMPIError("alpha challenge", err)
 	}
-	zOut, err := openingTranscript.DeriveZChallenge()
-	if err != nil {
-		return nil, trace, compiledMPIError("z challenge", err)
-	}
-	xi, nu, zChallenge := xiOut.Value, nuOut.Value, zOut.Value
+	gamma, alphaChallenge := gammaOut.Value, alphaChallengeOut.Value
 	profile.recordTotal(ProtocolMPIPhaseU0, time.Since(phaseStarted))
 
-	// U1: parties reveal only d_i[3] and one Laurent commitment. The root
-	// reconstructs h_xi coefficients and both public commitments.
+	// U1: workers reveal g_j(alpha_ch) and commit to their honest degree-<M
+	// functional Laurent witness. The coordinator reconstructs h_gamma.
 	phaseStarted = time.Now()
 	u1Share := MPIPayload{}
 	if role.Party != nil {
-		d, laurentCommitment, shareErr := compiledMPIOpeningU1Share(
+		a, laurentCommitment, shareErr := compiledMPIOpeningU1Share(
 			role.Party, &openingPartyState, localTreePair.T0, localTreePair.T1,
-			prepared, xi, nu, zChallenge,
+			prepared, gamma, alphaChallenge,
 		)
 		if shareErr != nil {
 			return nil, trace, compiledMPIError("U1 local", shareErr)
 		}
-		u1Share, err = PackProtocolU1Gather(ProtocolU1GatherRecord{D: d, LaurentCommitment: laurentCommitment})
+		u1Share, err = PackHybridProtocolU1Gather(HybridProtocolU1GatherRecord{A: a, LaurentCommitment: laurentCommitment})
 		if err != nil {
 			return nil, trace, compiledMPIError("U1 gather payload", err)
 		}
@@ -709,33 +704,37 @@ func compiledProveMPIWithTraceValidatedProfiled(
 	if err != nil {
 		return nil, trace, compiledMPIError("U1 gather", err)
 	}
-	var hCoefficients []fr.Element
+	var uHatCoefficients []fr.Element
 	u1RootPayload := MPIPayload{}
 	if isRoot {
-		hCoefficients = make([]fr.Element, m)
-		var message U1Message
+		uHatCoefficients = make([]fr.Element, m)
+		var message HybridU1Message
 		for slot := range u1Gathered {
-			record, decodeErr := UnpackProtocolU1Gather(u1Gathered[slot])
+			record, decodeErr := UnpackHybridProtocolU1Gather(u1Gathered[slot])
 			if decodeErr != nil {
 				return nil, trace, compiledMPIError("U1 gathered record", decodeErr)
 			}
-			xiPower := fr.One()
+			gammaPower := fr.One()
+			var weightedAtChallenge fr.Element
 			for claim := 0; claim < dlinkzgOpeningCircuitClaims; claim++ {
+				message.PartialAtChallenge[claim].Add(&message.PartialAtChallenge[claim], &record.A[claim])
 				var term fr.Element
-				term.Mul(&prepared.weights[slot], &record.D[claim])
-				message.LinkEvaluations[claim].Add(&message.LinkEvaluations[claim], &term)
-				term.Mul(&xiPower, &record.D[claim])
-				hCoefficients[slot].Add(&hCoefficients[slot], &term)
-				xiPower.Mul(&xiPower, &xi)
+				term.Mul(&gammaPower, &record.A[claim])
+				weightedAtChallenge.Add(&weightedAtChallenge, &term)
+				gammaPower.Mul(&gammaPower, &gamma)
 			}
+			if prepared.weights[slot].IsZero() {
+				return nil, trace, compiledMPIError("U1 equality weight", ErrDLinkZGOpeningRejected)
+			}
+			uHatCoefficients[slot].Div(&weightedAtChallenge, &prepared.weights[slot])
 			sourceCommitmentAdd(&message.LaurentCommitment, &record.LaurentCommitment)
 		}
-		message.LinkCommitment, err = role.Coordinator.SRS.CommitZ(hCoefficients)
+		message.FunctionalCommitment, err = role.Coordinator.SRS.CommitU(uHatCoefficients)
 		if err != nil {
-			return nil, trace, compiledMPIError("U1 link commitment", err)
+			return nil, trace, compiledMPIError("U1 functional commitment", err)
 		}
 		publicProof.U1 = message
-		u1RootPayload, err = PackProtocolU1Broadcast(message)
+		u1RootPayload, err = PackHybridProtocolU1Broadcast(message)
 		if err != nil {
 			return nil, trace, compiledMPIError("U1 broadcast assembly", err)
 		}
@@ -747,7 +746,7 @@ func compiledProveMPIWithTraceValidatedProfiled(
 	if err != nil {
 		return nil, trace, compiledMPIError("U1 broadcast", err)
 	}
-	publicProof.U1, err = UnpackProtocolU1Broadcast(u1PublicPayload)
+	publicProof.U1, err = UnpackHybridProtocolU1Broadcast(u1PublicPayload)
 	if err != nil {
 		return nil, trace, compiledMPIError("U1 decode", err)
 	}
@@ -759,30 +758,21 @@ func compiledProveMPIWithTraceValidatedProfiled(
 		return nil, trace, compiledMPIError("beta", err)
 	}
 	beta := betaOut.Value
-	if err := validateDLinkZGOpeningBeta(beta, zChallenge); err != nil {
-		return nil, trace, compiledMPIError("beta exclusion", err)
-	}
 	betaInverse := dlinkzgOpeningInverse(beta)
 	profile.recordTotal(ProtocolMPIPhaseU1, time.Since(phaseStarted))
 
-	// U2: six g evaluations and S_i(beta) are additive shares. The root
-	// evaluates h_xi,t0,t1 itself and derives the canonical S(beta^-1).
+	// U2: workers send only six non-diagonal circuit values. The coordinator
+	// derives all length-M functional/Laurent evaluations canonically.
 	phaseStarted = time.Now()
 	u2Share := MPIPayload{}
 	if role.Party != nil {
-		shareValues, shareErr := compiledMPIOpeningU2Share(
-			&openingPartyState, prepared, xi, nu, beta,
+		record, shareErr := compiledMPIOpeningU2Share(
+			&openingPartyState, openingInstance.SemanticQueryPoints, beta,
 		)
 		if shareErr != nil {
 			return nil, trace, compiledMPIError("U2 local", shareErr)
 		}
-		var record ProtocolU2AggregateRecord
-		for claim := 0; claim < dlinkzgOpeningCircuitClaims; claim++ {
-			record.PartialAtBeta[claim] = shareValues[2*claim]
-			record.PartialAtBetaInverse[claim] = shareValues[2*claim+1]
-		}
-		record.SAtBeta = shareValues[6]
-		u2Share, err = PackProtocolU2Aggregate(record)
+		u2Share, err = PackHybridProtocolU2Aggregate(record)
 		if err != nil {
 			return nil, trace, compiledMPIError("U2 aggregate payload", err)
 		}
@@ -796,31 +786,28 @@ func compiledProveMPIWithTraceValidatedProfiled(
 	}
 	u2RootPayload := MPIPayload{}
 	if isRoot {
-		record, decodeErr := UnpackProtocolU2Aggregate(u2AggregatePayload)
+		record, decodeErr := UnpackHybridProtocolU2Aggregate(u2AggregatePayload)
 		if decodeErr != nil {
 			return nil, trace, compiledMPIError("U2 aggregate decode", decodeErr)
 		}
-		message := U2Message{
-			PartialAtBeta:        record.PartialAtBeta,
-			PartialAtBetaInverse: record.PartialAtBetaInverse,
-		}
-		message.BatchAtBeta[0] = cryptodlinkzg.Eval(hCoefficients, beta)
-		message.BatchAtBetaInverse[0] = cryptodlinkzg.Eval(hCoefficients, betaInverse)
-		message.BatchAtBeta[1] = cryptodlinkzg.Eval(outerSuffix.t0, beta)
-		message.BatchAtBetaInverse[1] = cryptodlinkzg.Eval(outerSuffix.t0, betaInverse)
-		message.BatchAtBeta[2] = cryptodlinkzg.Eval(outerSuffix.t1, beta)
-		message.BatchAtBetaInverse[2] = cryptodlinkzg.Eval(outerSuffix.t1, betaInverse)
-		message.BatchAtBeta[3] = record.SAtBeta
-		left := dlinkzgOpeningLaurentLeft(message, prepared, xi, nu, beta)
-		target := dlinkzgOpeningLinearTarget(openingInstance, publicProof.U1.LinkEvaluations, xi, nu)
-		message.BatchAtBetaInverse[3], err = cryptodlinkzg.DeriveLaurentInverseValue(
-			beta, left, target, message.BatchAtBeta[3],
+		message := HybridU2Message{CircuitCrossValues: record.CircuitCrossValues}
+		message.LaurentAtBeta[0] = cryptodlinkzg.Eval(uHatCoefficients, beta)
+		message.LaurentAtBetaInverse[0] = cryptodlinkzg.Eval(uHatCoefficients, betaInverse)
+		message.LaurentAtBeta[1] = cryptodlinkzg.Eval(outerSuffix.t0, beta)
+		message.LaurentAtBetaInverse[1] = cryptodlinkzg.Eval(outerSuffix.t0, betaInverse)
+		message.LaurentAtBeta[2] = cryptodlinkzg.Eval(outerSuffix.t1, beta)
+		message.LaurentAtBetaInverse[2] = cryptodlinkzg.Eval(outerSuffix.t1, betaInverse)
+		aWeights, bWeights := treeWeightPolynomials(prepared.tree, gamma, prepared.m)
+		message.LaurentAtBeta[3] = compiledMPIHybridLaurentValue(
+			uHatCoefficients, outerSuffix.t0, outerSuffix.t1,
+			prepared.weights, aWeights, bWeights, beta,
 		)
-		if err != nil {
-			return nil, trace, compiledMPIError("U2 inverse derivation", err)
-		}
+		message.LaurentAtBetaInverse[3] = compiledMPIHybridLaurentValue(
+			uHatCoefficients, outerSuffix.t0, outerSuffix.t1,
+			prepared.weights, aWeights, bWeights, betaInverse,
+		)
 		publicProof.U2 = message
-		u2RootPayload, err = PackProtocolU2Broadcast(message)
+		u2RootPayload, err = PackHybridProtocolU2Broadcast(message)
 		if err != nil {
 			return nil, trace, compiledMPIError("U2 broadcast assembly", err)
 		}
@@ -832,15 +819,15 @@ func compiledProveMPIWithTraceValidatedProfiled(
 	if err != nil {
 		return nil, trace, compiledMPIError("U2 broadcast", err)
 	}
-	publicProof.U2, err = UnpackProtocolU2Broadcast(u2PublicPayload)
+	publicProof.U2, err = UnpackHybridProtocolU2Broadcast(u2PublicPayload)
 	if err != nil {
 		return nil, trace, compiledMPIError("U2 decode", err)
 	}
 	if err := openingTranscript.AppendU2(publicProof.U2); err != nil {
 		return nil, trace, compiledMPIError("U2 transcript", err)
 	}
-	if err := verifyDLinkZGOpeningScalarIdentity(
-		openingInstance, publicProof.U1, publicProof.U2, prepared, xi, nu, beta,
+	if err := verifyHybridOpeningScalarIdentity(
+		openingInstance, publicProof.U1, publicProof.U2, prepared, gamma, beta,
 	); err != nil {
 		return nil, trace, compiledMPIError("U2 scalar identity", err)
 	}
@@ -854,18 +841,20 @@ func compiledProveMPIWithTraceValidatedProfiled(
 	}
 	profile.recordTotal(ProtocolMPIPhaseU2, time.Since(phaseStarted))
 
-	// U3: parties aggregate WN,PiZ; PiY is coordinator-only.
+	// U3: workers aggregate the semantic same-set quotient, the length-M
+	// Laurent same-set quotient, and PiU. PiV is coordinator-only.
 	phaseStarted = time.Now()
 	u3Share := MPIPayload{}
 	if role.Party != nil {
 		shares, shareErr := compiledMPIOpeningU3Share(
-			role.Party, &openingPartyState, prepared, xi, zChallenge, beta, kappa,
+			role.Party, &openingPartyState, openingInstance.SemanticQueryPoints,
+			alphaChallenge, beta, kappa,
 		)
 		if shareErr != nil {
 			return nil, trace, compiledMPIError("U3 local", shareErr)
 		}
-		u3Share, err = PackProtocolU3Aggregate(ProtocolU3AggregateRecord{
-			WN: shares[0], PiZ: shares[1],
+		u3Share, err = PackHybridProtocolU3Aggregate(HybridProtocolU3AggregateRecord{
+			WCirc: shares[0], WLaur: shares[1], PiU: shares[2],
 		})
 		if err != nil {
 			return nil, trace, compiledMPIError("U3 aggregate payload", err)
@@ -880,21 +869,21 @@ func compiledProveMPIWithTraceValidatedProfiled(
 	}
 	u3RootPayload := MPIPayload{}
 	if isRoot {
-		record, decodeErr := UnpackProtocolU3Aggregate(u3AggregatePayload)
+		record, decodeErr := UnpackHybridProtocolU3Aggregate(u3AggregatePayload)
 		if decodeErr != nil {
 			return nil, trace, compiledMPIError("U3 aggregate decode", decodeErr)
 		}
-		message := U3Message{WN: record.WN, PiZ: record.PiZ}
-		qY, sourceValue := cryptodlinkzg.SyntheticDivision(hCoefficients, beta)
-		if !sourceValue.Equal(&publicProof.U2.BatchAtBeta[0]) {
+		message := HybridU3Message{WCirc: record.WCirc, WLaur: record.WLaur, PiU: record.PiU}
+		qY, sourceValue := cryptodlinkzg.SyntheticDivision(uHatCoefficients, beta)
+		if !sourceValue.Equal(&publicProof.U2.LaurentAtBeta[0]) {
 			return nil, trace, compiledMPIError("U3 source-link value", ErrDLinkZGOpeningRejected)
 		}
-		message.PiY, err = role.Coordinator.SRS.CommitY(qY)
+		message.PiV, err = role.Coordinator.SRS.CommitY(qY)
 		if err != nil {
-			return nil, trace, compiledMPIError("U3 PiY", err)
+			return nil, trace, compiledMPIError("U3 PiV", err)
 		}
 		publicProof.U3 = message
-		u3RootPayload, err = PackProtocolU3Broadcast(message)
+		u3RootPayload, err = PackHybridProtocolU3Broadcast(message)
 		if err != nil {
 			return nil, trace, compiledMPIError("U3 broadcast assembly", err)
 		}
@@ -906,7 +895,7 @@ func compiledProveMPIWithTraceValidatedProfiled(
 	if err != nil {
 		return nil, trace, compiledMPIError("U3 broadcast", err)
 	}
-	publicProof.U3, err = UnpackProtocolU3Broadcast(u3PublicPayload)
+	publicProof.U3, err = UnpackHybridProtocolU3Broadcast(u3PublicPayload)
 	if err != nil {
 		return nil, trace, compiledMPIError("U3 decode", err)
 	}
@@ -1067,11 +1056,11 @@ func compiledMPICoordinatorBuildOuterSuffix(
 		return result, err
 	}
 	_, result.t0, result.t1 = state.CoordinatorProductCheckWitness()
-	result.productCheck.Commitments[0], err = coordinator.SRS.CommitZ(result.t0)
+	result.productCheck.Commitments[0], err = coordinator.SRS.CommitU(result.t0)
 	if err != nil {
 		return compiledMPIOuterSuffix{}, err
 	}
-	result.productCheck.Commitments[1], err = coordinator.SRS.CommitZ(result.t1)
+	result.productCheck.Commitments[1], err = coordinator.SRS.CommitU(result.t1)
 	if err != nil {
 		return compiledMPIOuterSuffix{}, err
 	}
@@ -1205,13 +1194,12 @@ func compiledMPIReplayOuterSuffix(
 	return challenges, mu, nil
 }
 
-func compiledMPIPrepareOpening(instance DLinkZGOpeningInstance) (dlinkzgOpeningPrepared, error) {
-	prepared, err := prepareDLinkZGOpeningInstance(instance)
+func compiledMPIPrepareOpening(instance DLinkZGOpeningInstance) (hybridOpeningPrepared, error) {
+	prepared, err := prepareHybridOpeningInstance(instance)
 	if err != nil {
 		return prepared, err
 	}
 	prepared.weights = cryptodlinkzg.EqualityWeights(instance.PartitionPoint)
-	prepared.psiR = append([]fr.Element(nil), prepared.weights...)
 	return prepared, nil
 }
 
@@ -1219,30 +1207,22 @@ func compiledMPIOpeningU0Share(
 	party *CompiledPartySetup,
 	sources [LocalCompressedSourceCount][]fr.Element,
 	sourceValues [LocalCompressedSourceCount]fr.Element,
-	instance DLinkZGOpeningInstance,
-	prepared dlinkzgOpeningPrepared,
-) (compiledMPIOpeningPartyState, U0Message, error) {
+	_ DLinkZGOpeningInstance,
+	prepared hybridOpeningPrepared,
+) (compiledMPIOpeningPartyState, HybridU0Message, error) {
 	var state compiledMPIOpeningPartyState
-	var share U0Message
+	var share HybridU0Message
 	rank := party.Rank
-	sourceBatch := make([][]fr.Element, dlinkzgOpeningCircuitClaims)
 	for claim := 0; claim < dlinkzgOpeningCircuitClaims; claim++ {
 		if len(sources[claim]) > prepared.t {
 			return state, share, fmt.Errorf("%w: source %d exceeds T", ErrCompiledMPIProtocol, claim)
 		}
-		sourceBatch[claim] = sources[claim]
-	}
-	shiftedBatch := cryptodlinkzg.FastTaylorShiftBatchWithPrecomputation(
-		sourceBatch,
-		party.FastTaylorShift,
-	)
-	for claim := 0; claim < dlinkzgOpeningCircuitClaims; claim++ {
-		state.local.shifted[claim] = shiftedBatch[claim]
-		state.local.g[claim] = dlinkzgOpeningScalePolynomial(state.local.shifted[claim], prepared.weights[rank])
+		state.sources[claim] = append([]fr.Element(nil), sources[claim]...)
+		state.local.g[claim] = dlinkzgOpeningScalePolynomial(state.sources[claim], prepared.weights[rank])
 		state.localCircuitClaims[claim].Mul(&prepared.weights[rank], &sourceValues[claim])
-		commitment, err := party.RowSRS.CommitZ(state.local.g[claim])
+		commitment, err := party.RowSRS.CommitU(state.local.g[claim])
 		if err != nil {
-			return compiledMPIOpeningPartyState{}, U0Message{}, err
+			return compiledMPIOpeningPartyState{}, HybridU0Message{}, err
 		}
 		share.PartialCommitments[claim] = commitment
 	}
@@ -1253,166 +1233,168 @@ func compiledMPIOpeningU1Share(
 	party *CompiledPartySetup,
 	state *compiledMPIOpeningPartyState,
 	t0, t1 fr.Element,
-	prepared dlinkzgOpeningPrepared,
-	xi, nu, zChallenge fr.Element,
+	prepared hybridOpeningPrepared,
+	gamma, alphaChallenge fr.Element,
 ) ([dlinkzgOpeningCircuitClaims]fr.Element, bn254.G1Affine, error) {
-	var d [dlinkzgOpeningCircuitClaims]fr.Element
-	// The tree weights have only M coefficients. Padding them to T used to
-	// allocate and scan two mostly-zero vectors on every worker.
-	aWeights, bWeights := treeWeightPolynomials(prepared.tree, xi, prepared.m)
-	xiPower := fr.One()
+	var a [dlinkzgOpeningCircuitClaims]fr.Element
+	aWeights, bWeights := treeWeightPolynomials(prepared.tree, gamma, prepared.m)
+	state.local.pGamma = make([]fr.Element, prepared.t)
+	gammaPower := fr.One()
+	var weightedAtChallenge fr.Element
 	for claim := 0; claim < dlinkzgOpeningCircuitClaims; claim++ {
-		state.local.d[claim] = cryptodlinkzg.Eval(state.local.shifted[claim], zChallenge)
-		d[claim] = state.local.d[claim]
+		state.local.a[claim] = cryptodlinkzg.Eval(state.local.g[claim], alphaChallenge)
+		a[claim] = state.local.a[claim]
+		dlinkzgOpeningAddScaled(state.local.pGamma, state.sources[claim], gammaPower)
 		var term fr.Element
-		term.Mul(&xiPower, &state.local.d[claim])
-		state.local.dLink.Add(&state.local.dLink, &term)
-		xiPower.Mul(&xiPower, &xi)
+		term.Mul(&gammaPower, &state.local.a[claim])
+		weightedAtChallenge.Add(&weightedAtChallenge, &term)
+		gammaPower.Mul(&gammaPower, &gamma)
 	}
-	state.local.h = dlinkzgOpeningMonomial(state.local.dLink, party.Rank)
+	if prepared.weights[party.Rank].IsZero() {
+		return a, bn254.G1Affine{}, fmt.Errorf("%w: zero partition equality weight", ErrCompiledMPIProtocol)
+	}
+	state.local.uHat.Div(&weightedAtChallenge, &prepared.weights[party.Rank])
+	state.local.h = dlinkzgOpeningMonomial(state.local.uHat, party.Rank)
 	state.local.t0 = dlinkzgOpeningMonomial(t0, party.Rank)
 	state.local.t1 = dlinkzgOpeningMonomial(t1, party.Rank)
-	state.local.input = cryptodlinkzg.LocalLaurentInput{
-		G: state.local.g, P: prepared.scales, Xi: xi,
-		HXi: state.local.h, PsiR: prepared.psiR, Nu: nu,
+	state.local.sFun = cryptodlinkzg.BuildLocalLaurentWithDomain(cryptodlinkzg.LocalLaurentInput{
+		HXi: state.local.h, PsiR: prepared.weights, Nu: fr.One(),
 		T0: state.local.t0, T1: state.local.t1, AXi: aWeights, BXi: bWeights,
-	}
-	state.local.laurent = cryptodlinkzg.BuildLocalLaurentWithTranslatedCircuitQueries(
-		state.local.input,
-		prepared.circuitRatios,
-		party.FastFixed.convolutionDomain,
-	)
-	state.localTarget = compiledMPILocalLaurentTarget(
-		state.localCircuitClaims,
-		state.local.dLink,
-		prepared.weights[party.Rank],
-		t0,
-		t1,
-		aWeights[party.Rank],
-		bWeights[party.Rank],
-		xi,
-		nu,
-	)
-	commitment, err := party.RowSRS.CommitZ(state.local.laurent)
+	}, party.FastFixed.convolutionDomain)
+	commitment, err := party.RowSRS.CommitU(state.local.sFun)
 	if err != nil {
-		return d, bn254.G1Affine{}, err
+		return a, bn254.G1Affine{}, err
 	}
-	return d, commitment, nil
+	return a, commitment, nil
 }
 
 func compiledMPIOpeningU2Share(
 	state *compiledMPIOpeningPartyState,
-	prepared dlinkzgOpeningPrepared,
-	xi, nu,
+	semanticPoints [dlinkzgOpeningCircuitClaims]fr.Element,
 	beta fr.Element,
-) ([7]fr.Element, error) {
-	var result [7]fr.Element
-	var localU2 U2Message
+) (HybridProtocolU2AggregateRecord, error) {
+	var result HybridProtocolU2AggregateRecord
 	betaInverse := dlinkzgOpeningInverse(beta)
 	for claim := 0; claim < dlinkzgOpeningCircuitClaims; claim++ {
-		state.local.gAtBeta[claim] = cryptodlinkzg.Eval(state.local.g[claim], beta)
-		state.local.gAtBetaInverse[claim] = cryptodlinkzg.Eval(state.local.g[claim], betaInverse)
-		result[2*claim] = state.local.gAtBeta[claim]
-		result[2*claim+1] = state.local.gAtBetaInverse[claim]
-		localU2.PartialAtBeta[claim] = state.local.gAtBeta[claim]
-		localU2.PartialAtBetaInverse[claim] = state.local.gAtBetaInverse[claim]
+		cross := 0
+		for semantic := 0; semantic < dlinkzgOpeningCircuitClaims; semantic++ {
+			value := cryptodlinkzg.Eval(state.local.g[claim], semanticPoints[semantic])
+			state.local.semanticValues[claim][semantic] = value
+			if semantic == claim {
+				if !value.Equal(&state.localCircuitClaims[claim]) {
+					return HybridProtocolU2AggregateRecord{}, fmt.Errorf("%w: local semantic claim %d", ErrCompiledMPIProtocol, claim)
+				}
+				continue
+			}
+			result.CircuitCrossValues[claim][cross] = value
+			cross++
+		}
 	}
-	localPolynomials := [3][]fr.Element{state.local.h, state.local.t0, state.local.t1}
+	localPolynomials := [4][]fr.Element{state.local.h, state.local.t0, state.local.t1, state.local.sFun}
 	for polynomial := range localPolynomials {
-		state.local.lAtBeta[polynomial] = cryptodlinkzg.Eval(localPolynomials[polynomial], beta)
-		state.local.lAtBetaInverse[polynomial] = cryptodlinkzg.Eval(localPolynomials[polynomial], betaInverse)
-		localU2.BatchAtBeta[polynomial] = state.local.lAtBeta[polynomial]
-		localU2.BatchAtBetaInverse[polynomial] = state.local.lAtBetaInverse[polynomial]
+		state.local.laurentAtBeta[polynomial] = cryptodlinkzg.Eval(localPolynomials[polynomial], beta)
+		state.local.laurentAtBetaInverse[polynomial] = cryptodlinkzg.Eval(localPolynomials[polynomial], betaInverse)
 	}
-	state.localSAtBeta = cryptodlinkzg.Eval(state.local.laurent, beta)
-	result[6] = state.localSAtBeta
-	// Reuse the six g_j evaluations above and evaluate the public query
-	// polynomials in product form. The former path repeated twelve dense Horner
-	// scans here (six g_j and six length-T PsiQ evaluations).
-	localLeft := dlinkzgOpeningLaurentLeft(localU2, prepared, xi, nu, beta)
-	localSAtBetaInverse, err := cryptodlinkzg.DeriveLaurentInverseValue(
-		beta,
-		localLeft,
-		state.localTarget,
-		state.localSAtBeta,
-	)
-	state.localSAtBetaInverse = localSAtBetaInverse
-	return result, err
+	return result, nil
 }
 
-func compiledMPILocalLaurentTarget(
-	circuitClaims [dlinkzgOpeningCircuitClaims]fr.Element,
-	dLink, partitionWeight, t0, t1, aWeight, bWeight, xi, nu fr.Element,
+func compiledMPIHybridLaurentValue(
+	h, t0, t1, psiR, aWeights, bWeights []fr.Element,
+	point fr.Element,
 ) fr.Element {
-	var target, term fr.Element
-	xiPower := fr.One()
-	for claim := range circuitClaims {
-		term.Mul(&xiPower, &circuitClaims[claim])
-		target.Add(&target, &term)
-		xiPower.Mul(&xiPower, &xi)
+	var result fr.Element
+	terms := [3][]fr.Element{h, t0, t1}
+	weights := [3][]fr.Element{psiR, aWeights, bWeights}
+	for term := range terms {
+		spans := compiledMPIHybridOffDiagonalSpans(weights[term], point)
+		limit := len(terms[term])
+		if len(spans) < limit {
+			limit = len(spans)
+		}
+		for index := 0; index < limit; index++ {
+			var contribution fr.Element
+			contribution.Mul(&terms[term][index], &spans[index])
+			result.Add(&result, &contribution)
+		}
 	}
-	term.Mul(&dLink, &partitionWeight).Mul(&term, &nu)
-	target.Add(&target, &term)
-	term.Mul(&t0, &aWeight)
-	target.Add(&target, &term)
-	term.Mul(&t1, &bWeight)
-	target.Add(&target, &term)
-	return target
+	return result
+}
+
+// compiledMPIHybridOffDiagonalSpans returns L_i(z)+R_i(z), where
+// L_{i+1}=zL_i+v_i and R_{i-1}=v_i+zR_i. Thus one dot product evaluates
+// OffDiag(c,V)(z) in O(M) without constructing its coefficient vector.
+func compiledMPIHybridOffDiagonalSpans(weights []fr.Element, point fr.Element) []fr.Element {
+	spans := make([]fr.Element, len(weights))
+	var left fr.Element
+	for index := 0; index < len(weights); index++ {
+		spans[index].Set(&left)
+		left.Mul(&left, &point)
+		left.Add(&left, &weights[index])
+	}
+	var right fr.Element
+	for index := len(weights) - 1; index >= 0; index-- {
+		spans[index].Add(&spans[index], &right)
+		right.Mul(&right, &point)
+		right.Add(&right, &weights[index])
+	}
+	return spans
 }
 
 func compiledMPIOpeningU3Share(
 	party *CompiledPartySetup,
 	state *compiledMPIOpeningPartyState,
-	prepared dlinkzgOpeningPrepared,
-	xi, zChallenge, beta, kappa fr.Element,
-) ([2]bn254.G1Affine, error) {
-	var result [2]bn254.G1Affine
+	semanticPoints [dlinkzgOpeningCircuitClaims]fr.Element,
+	alphaChallenge, beta, kappa fr.Element,
+) ([3]bn254.G1Affine, error) {
+	var result [3]bn254.G1Affine
 	betaInverse := dlinkzgOpeningInverse(beta)
-	gPoints := []fr.Element{zChallenge, beta, betaInverse}
-	gInputs := make([]cryptodlinkzg.SameSetInput, dlinkzgOpeningCircuitClaims)
+	circuitPoints := hybridCircuitPoints(alphaChallenge, semanticPoints)
+	circuitInputs := make([]cryptodlinkzg.SameSetInput, dlinkzgOpeningCircuitClaims)
 	for claim := 0; claim < dlinkzgOpeningCircuitClaims; claim++ {
-		var atZ fr.Element
-		atZ.Mul(&prepared.weights[party.Rank], &state.local.d[claim])
-		gInputs[claim] = cryptodlinkzg.SameSetInput{
-			Polynomial: state.local.g[claim],
+		values := make([]fr.Element, 0, len(circuitPoints))
+		values = append(values, state.local.a[claim])
+		values = append(values, state.local.semanticValues[claim][:]...)
+		circuitInputs[claim] = cryptodlinkzg.SameSetInput{
+			Polynomial:    state.local.g[claim],
+			ClaimedValues: values,
+		}
+	}
+	circuitBatch, err := cryptodlinkzg.BuildSameSetQuotient(circuitInputs, circuitPoints, kappa)
+	if err != nil {
+		return [3]bn254.G1Affine{}, err
+	}
+	result[0], err = party.RowSRS.CommitU(circuitBatch.Quotient)
+	if err != nil {
+		return [3]bn254.G1Affine{}, err
+	}
+
+	laurentPolynomials := [4][]fr.Element{state.local.h, state.local.t0, state.local.t1, state.local.sFun}
+	laurentInputs := make([]cryptodlinkzg.SameSetInput, len(laurentPolynomials))
+	for polynomial := range laurentPolynomials {
+		laurentInputs[polynomial] = cryptodlinkzg.SameSetInput{
+			Polynomial: laurentPolynomials[polynomial],
 			ClaimedValues: []fr.Element{
-				atZ,
-				state.local.gAtBeta[claim],
-				state.local.gAtBetaInverse[claim],
+				state.local.laurentAtBeta[polynomial],
+				state.local.laurentAtBetaInverse[polynomial],
 			},
 		}
 	}
-	lPolynomials := [4][]fr.Element{state.local.h, state.local.t0, state.local.t1, state.local.laurent}
-	lInputs := make([]cryptodlinkzg.SameSetInput, len(lPolynomials))
-	for polynomial := range lPolynomials {
-		values := []fr.Element{state.localSAtBeta, state.localSAtBetaInverse}
-		if polynomial < len(state.local.lAtBeta) {
-			values[0] = state.local.lAtBeta[polynomial]
-			values[1] = state.local.lAtBetaInverse[polynomial]
-		}
-		lInputs[polynomial] = cryptodlinkzg.SameSetInput{Polynomial: lPolynomials[polynomial], ClaimedValues: values}
-	}
-	nestedBatch, err := cryptodlinkzg.BuildNestedSetQuotient(
-		gInputs, gPoints, lInputs, []fr.Element{beta, betaInverse}, kappa,
+	laurentBatch, err := cryptodlinkzg.BuildSameSetQuotient(
+		laurentInputs, []fr.Element{beta, betaInverse}, kappa,
 	)
 	if err != nil {
-		return [2]bn254.G1Affine{}, err
+		return [3]bn254.G1Affine{}, err
 	}
-	result[0], err = party.RowSRS.CommitZ(nestedBatch.Quotient)
+	result[1], err = party.RowSRS.CommitU(laurentBatch.Quotient)
 	if err != nil {
-		return [2]bn254.G1Affine{}, err
+		return [3]bn254.G1Affine{}, err
 	}
-	pXi := make([]fr.Element, prepared.t)
-	xiPower := fr.One()
-	for claim := 0; claim < dlinkzgOpeningCircuitClaims; claim++ {
-		dlinkzgOpeningAddScaled(pXi, state.local.shifted[claim], xiPower)
-		xiPower.Mul(&xiPower, &xi)
+
+	qU, remainder := cryptodlinkzg.SyntheticDivision(state.local.pGamma, alphaChallenge)
+	if !remainder.Equal(&state.local.uHat) {
+		return [3]bn254.G1Affine{}, fmt.Errorf("%w: local source-link remainder", ErrCompiledMPIProtocol)
 	}
-	qZ, remainder := cryptodlinkzg.SyntheticDivision(pXi, zChallenge)
-	if !remainder.Equal(&state.local.dLink) {
-		return [2]bn254.G1Affine{}, fmt.Errorf("%w: local source-link remainder", ErrCompiledMPIProtocol)
-	}
-	result[1], err = party.RowSRS.CommitRow(qZ)
+	result[2], err = party.RowSRS.CommitSemantic(qU)
 	return result, err
 }
 

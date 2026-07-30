@@ -219,11 +219,15 @@ func NewDeterministicCompiledSetup(
 	if err != nil {
 		return nil, fmt.Errorf("%w: aggregate fixed commitments: %v", ErrInvalidCompiledSetup, err)
 	}
-	coordinatorSRS, err := cryptodlinkzg.NewDeterministicCoordinatorSRS(partitions, tauY, tauZ)
+	coordinatorSRS, err := cryptodlinkzg.NewDeterministicCoordinatorSRSWithShift(
+		partitions, tauY, tauZ, shift.Sigma,
+	)
 	if err != nil {
 		return nil, fmt.Errorf("%w: coordinator SRS: %v", ErrInvalidCompiledSetup, err)
 	}
-	verifierSRS := cryptodlinkzg.NewDeterministicVerifierSRS(tauY, tauZ)
+	verifierSRS := cryptodlinkzg.NewDeterministicVerifierSRSWithShift(
+		tauY, tauZ, shift.Sigma,
+	)
 	result.Coordinator = CompiledCoordinatorSetup{
 		SRS:                  coordinatorSRS,
 		FixedCommitments:     aggregateFixed,

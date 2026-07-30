@@ -13,9 +13,9 @@ import (
 
 const (
 	compiledProofMagic        = "DLKZGPRF"
-	compiledProofVersion      = uint16(2)
+	compiledProofVersion      = uint16(3)
 	compiledProofHeaderSize   = 20
-	compiledProofG1Count      = 17
+	compiledProofG1Count      = 18
 	compiledProofFixedFrCount = 43
 )
 
@@ -33,7 +33,7 @@ var (
 // therefore are not serialized. Retained W3 records, clear party tables, and
 // all prover-only state are likewise absent.
 //
-// For M partitions it contains exactly 17 compressed G1 elements and
+// For M partitions it contains exactly 18 compressed G1 elements and
 // 6*log2(M)+43 scalar-field elements.
 type CompiledProof struct {
 	W0               OuterW0Message
@@ -42,10 +42,10 @@ type CompiledProof struct {
 	ProductCheck     OuterProductCheckCommitmentsMessage
 	SumCheckRounds   []OuterSumCheckRoundMessage
 	FinalEvaluations OuterFinalEvaluationsMessage
-	U0               U0Message
-	U1               U1Message
-	U2               U2Message
-	U3               U3Message
+	U0               HybridU0Message
+	U1               HybridU1Message
+	U2               HybridU2Message
+	U3               HybridU3Message
 }
 
 // CompiledProofElementCounts returns the exact accepted-path proof inventory
@@ -120,22 +120,24 @@ func (proof *CompiledProof) MarshalBinary(partitions uint64) ([]byte, error) {
 	for i := range proof.U0.PartialCommitments {
 		encoded = appendCompiledProofG1(encoded, &proof.U0.PartialCommitments[i])
 	}
-	for i := range proof.U1.LinkEvaluations {
-		encoded = appendCompiledProofField(encoded, &proof.U1.LinkEvaluations[i])
+	for i := range proof.U1.PartialAtChallenge {
+		encoded = appendCompiledProofField(encoded, &proof.U1.PartialAtChallenge[i])
 	}
-	encoded = appendCompiledProofG1(encoded, &proof.U1.LinkCommitment)
+	encoded = appendCompiledProofG1(encoded, &proof.U1.FunctionalCommitment)
 	encoded = appendCompiledProofG1(encoded, &proof.U1.LaurentCommitment)
-	for i := range proof.U2.PartialAtBeta {
-		encoded = appendCompiledProofField(encoded, &proof.U2.PartialAtBeta[i])
-		encoded = appendCompiledProofField(encoded, &proof.U2.PartialAtBetaInverse[i])
+	for claim := range proof.U2.CircuitCrossValues {
+		for cross := range proof.U2.CircuitCrossValues[claim] {
+			encoded = appendCompiledProofField(encoded, &proof.U2.CircuitCrossValues[claim][cross])
+		}
 	}
-	for i := range proof.U2.BatchAtBeta {
-		encoded = appendCompiledProofField(encoded, &proof.U2.BatchAtBeta[i])
-		encoded = appendCompiledProofField(encoded, &proof.U2.BatchAtBetaInverse[i])
+	for i := range proof.U2.LaurentAtBeta {
+		encoded = appendCompiledProofField(encoded, &proof.U2.LaurentAtBeta[i])
+		encoded = appendCompiledProofField(encoded, &proof.U2.LaurentAtBetaInverse[i])
 	}
-	encoded = appendCompiledProofG1(encoded, &proof.U3.WN)
-	encoded = appendCompiledProofG1(encoded, &proof.U3.PiZ)
-	encoded = appendCompiledProofG1(encoded, &proof.U3.PiY)
+	encoded = appendCompiledProofG1(encoded, &proof.U3.WCirc)
+	encoded = appendCompiledProofG1(encoded, &proof.U3.WLaur)
+	encoded = appendCompiledProofG1(encoded, &proof.U3.PiU)
+	encoded = appendCompiledProofG1(encoded, &proof.U3.PiV)
 
 	if len(encoded) != encodedSize {
 		return nil, fmt.Errorf("%w: internal size mismatch %d != %d", ErrCompiledProofEncoding, len(encoded), encodedSize)
@@ -213,40 +215,42 @@ func DecodeCompiledProof(encoded []byte, partitions uint64) (*CompiledProof, err
 			return nil, err
 		}
 	}
-	for i := range proof.U1.LinkEvaluations {
-		if err := decoder.field(&proof.U1.LinkEvaluations[i], "U1", i); err != nil {
+	for i := range proof.U1.PartialAtChallenge {
+		if err := decoder.field(&proof.U1.PartialAtChallenge[i], "U1", i); err != nil {
 			return nil, err
 		}
 	}
-	if err := decoder.g1(&proof.U1.LinkCommitment, "U1 link", 0); err != nil {
+	if err := decoder.g1(&proof.U1.FunctionalCommitment, "U1 functional", 0); err != nil {
 		return nil, err
 	}
 	if err := decoder.g1(&proof.U1.LaurentCommitment, "U1 Laurent", 0); err != nil {
 		return nil, err
 	}
-	for i := range proof.U2.PartialAtBeta {
-		if err := decoder.field(&proof.U2.PartialAtBeta[i], "U2 partial beta", i); err != nil {
+	for claim := range proof.U2.CircuitCrossValues {
+		for cross := range proof.U2.CircuitCrossValues[claim] {
+			if err := decoder.field(&proof.U2.CircuitCrossValues[claim][cross], "U2 circuit cross", claim*2+cross); err != nil {
+				return nil, err
+			}
+		}
+	}
+	for i := range proof.U2.LaurentAtBeta {
+		if err := decoder.field(&proof.U2.LaurentAtBeta[i], "U2 Laurent beta", i); err != nil {
 			return nil, err
 		}
-		if err := decoder.field(&proof.U2.PartialAtBetaInverse[i], "U2 partial beta inverse", i); err != nil {
+		if err := decoder.field(&proof.U2.LaurentAtBetaInverse[i], "U2 Laurent beta inverse", i); err != nil {
 			return nil, err
 		}
 	}
-	for i := range proof.U2.BatchAtBeta {
-		if err := decoder.field(&proof.U2.BatchAtBeta[i], "U2 batch beta", i); err != nil {
-			return nil, err
-		}
-		if err := decoder.field(&proof.U2.BatchAtBetaInverse[i], "U2 batch beta inverse", i); err != nil {
-			return nil, err
-		}
-	}
-	if err := decoder.g1(&proof.U3.WN, "U3", 0); err != nil {
+	if err := decoder.g1(&proof.U3.WCirc, "U3", 0); err != nil {
 		return nil, err
 	}
-	if err := decoder.g1(&proof.U3.PiZ, "U3", 1); err != nil {
+	if err := decoder.g1(&proof.U3.WLaur, "U3", 1); err != nil {
 		return nil, err
 	}
-	if err := decoder.g1(&proof.U3.PiY, "U3", 2); err != nil {
+	if err := decoder.g1(&proof.U3.PiU, "U3", 2); err != nil {
+		return nil, err
+	}
+	if err := decoder.g1(&proof.U3.PiV, "U3", 3); err != nil {
 		return nil, err
 	}
 	if decoder.offset != len(encoded) {
@@ -322,11 +326,12 @@ func validateCompiledProof(proof *CompiledProof) error {
 		name  string
 		value *bn254.G1Affine
 	}{
-		{"U1.link", &proof.U1.LinkCommitment},
+		{"U1.functional", &proof.U1.FunctionalCommitment},
 		{"U1.Laurent", &proof.U1.LaurentCommitment},
-		{"U3.WN", &proof.U3.WN},
-		{"U3.PiZ", &proof.U3.PiZ},
-		{"U3.PiY", &proof.U3.PiY},
+		{"U3.WCirc", &proof.U3.WCirc},
+		{"U3.WLaur", &proof.U3.WLaur},
+		{"U3.PiU", &proof.U3.PiU},
+		{"U3.PiV", &proof.U3.PiV},
 	}
 	for i := range remainingPoints {
 		if err := validatePoint(remainingPoints[i].name, remainingPoints[i].value); err != nil {
@@ -347,16 +352,21 @@ func validateCompiledProof(proof *CompiledProof) error {
 	}{
 		{"final terminal", proof.FinalEvaluations.Terminal[:]},
 		{"final ProductCheck", proof.FinalEvaluations.ProductCheck[:]},
-		{"U1 link", proof.U1.LinkEvaluations[:]},
-		{"U2 partial beta", proof.U2.PartialAtBeta[:]},
-		{"U2 partial beta inverse", proof.U2.PartialAtBetaInverse[:]},
-		{"U2 batch beta", proof.U2.BatchAtBeta[:]},
-		{"U2 batch beta inverse", proof.U2.BatchAtBetaInverse[:]},
+		{"U1 partial challenge", proof.U1.PartialAtChallenge[:]},
+		{"U2 Laurent beta", proof.U2.LaurentAtBeta[:]},
+		{"U2 Laurent beta inverse", proof.U2.LaurentAtBetaInverse[:]},
 	}
 	for group := range fieldGroups {
 		for i := range fieldGroups[group].values {
 			if err := validateTranscriptField(&fieldGroups[group].values[i]); err != nil {
 				return fmt.Errorf("%w: %s field element %d: %v", ErrInvalidCompiledProof, fieldGroups[group].name, i, err)
+			}
+		}
+	}
+	for claim := range proof.U2.CircuitCrossValues {
+		for cross := range proof.U2.CircuitCrossValues[claim] {
+			if err := validateTranscriptField(&proof.U2.CircuitCrossValues[claim][cross]); err != nil {
+				return fmt.Errorf("%w: U2 circuit cross %d:%d: %v", ErrInvalidCompiledProof, claim, cross, err)
 			}
 		}
 	}

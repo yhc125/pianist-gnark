@@ -105,7 +105,13 @@ func TestCompiledProveMPIEqualsCentralProofM2M4(t *testing.T) {
 				t.Fatalf("marshal distributed proof: %v", err)
 			}
 			if !bytes.Equal(distributedEncoded, centralEncoded) {
-				t.Fatal("distributed proof differs byte-for-byte from centralized proof")
+				t.Fatalf(
+					"distributed proof differs byte-for-byte from centralized proof: U0=%t U1=%t U2=%t U3=%t",
+					reflect.DeepEqual(results[0].proof.U0, fixture.proof.U0),
+					reflect.DeepEqual(results[0].proof.U1, fixture.proof.U1),
+					reflect.DeepEqual(results[0].proof.U2, fixture.proof.U2),
+					reflect.DeepEqual(results[0].proof.U3, fixture.proof.U3),
+				)
 			}
 			if err := CompiledVerify(fixture.vk, fixture.statement, *results[0].proof); err != nil {
 				t.Fatalf("verify distributed proof: %v", err)
@@ -114,7 +120,7 @@ func TestCompiledProveMPIEqualsCentralProofM2M4(t *testing.T) {
 			logM := bitsForCompiledProtocol(partitions)
 			root := results[0].accounting.Total
 			wantRootReceive := uint64((partitions - 1) * 1408)
-			wantRootSend := uint64((partitions - 1) * (1984 + 192*logM))
+			wantRootSend := uint64((partitions - 1) * (2016 + 192*logM))
 			if root.PayloadBytesRecv != wantRootReceive || root.PayloadBytesSent != wantRootSend {
 				t.Fatalf(
 					"root payload bytes recv/send = %d/%d, want %d/%d",

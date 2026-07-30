@@ -93,12 +93,24 @@ func TestInitializeMPIWorldSingleProcessAndMissingDistributedEnvironment(t *test
 		t.Fatal("distributed initialization without PIANIST_MPI_* was accepted")
 	}
 
+	// Native loopback workers are direct child processes and need no SSH
+	// credentials. A preinitialized world keeps this test focused on config
+	// validation rather than launching a child process.
+	t.Setenv("SIMPLEMPI_LAUNCH_MODE", "local")
+	t.Setenv("PIANIST_MPI_IP_FILE", "/does/not/exist/ip.txt")
+	mpi.SelfRank = 0
+	mpi.WorldSize = 2
+	if err := initializeMPIWorld(validTestConfig("dlinkzg", 2)); err != nil {
+		t.Fatalf("local launcher required SSH credentials: %v", err)
+	}
+
 	// The legacy Pianist DKZG package normally initializes simpleMPI before
 	// main. Dummy paths prove that initializeMPIWorld does not try to launch a
 	// second root or worker when the runtime already has a nonzero world.
 	t.Setenv("PIANIST_MPI_IP_FILE", "/does/not/exist/ip.txt")
 	t.Setenv("PIANIST_MPI_SSH_KEY", "/does/not/exist/key")
 	t.Setenv("PIANIST_MPI_SSH_USER", "nobody")
+	t.Setenv("SIMPLEMPI_LAUNCH_MODE", "ssh")
 	mpi.SelfRank = 0
 	mpi.WorldSize = 2
 	if err := initializeMPIWorld(validTestConfig("dlinkzg", 2)); err != nil {
@@ -264,8 +276,8 @@ func TestExpectedDLinKZGRootAccountingM2M4(t *testing.T) {
 		framingSent, framingRecv             float64
 		fieldElements, encoded, uncompressed float64
 	}{
-		{2, 2176, 1408, 2356, 1568, 180, 160, 49, 2132, 2676},
-		{4, 7104, 4224, 7644, 4704, 540, 480, 55, 2324, 2868},
+		{2, 2208, 1408, 2388, 1568, 180, 160, 49, 2164, 2740},
+		{4, 7200, 4224, 7740, 4704, 540, 480, 55, 2356, 2932},
 	}
 	for _, test := range tests {
 		payloadSent, payloadRecv, wireSent, wireRecv, err :=
@@ -303,7 +315,7 @@ func TestExpectedDLinKZGRootAccountingM2M4(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if artifacts["proof_g1_elements"] != 17 ||
+		if artifacts["proof_g1_elements"] != 18 ||
 			artifacts["proof_field_elements"] != test.fieldElements ||
 			artifacts["proof_bytes"] != test.encoded ||
 			artifacts["proof_bytes_uncompressed"] != test.uncompressed ||

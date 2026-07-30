@@ -58,6 +58,29 @@ type ProtocolU3AggregateRecord struct {
 	PiZ bn254.G1Affine
 }
 
+// HybridProtocolU1GatherRecord is one party's degree-aware hybrid U1
+// record. A contains g_j(alpha_ch); LaurentCommitment is the additive
+// commitment share for S_i^fun.
+type HybridProtocolU1GatherRecord struct {
+	A                 [LocalCompressedSourceCount]fr.Element
+	LaurentCommitment bn254.G1Affine
+}
+
+// HybridProtocolU2AggregateRecord contains only the six non-diagonal
+// semantic circuit values. The coordinator derives all functional/Laurent
+// values canonically from the M coefficients it already holds.
+type HybridProtocolU2AggregateRecord struct {
+	CircuitCrossValues [LocalCompressedSourceCount][2]fr.Element
+}
+
+// HybridProtocolU3AggregateRecord contains the three worker-computable
+// quotient commitments. PiV is coordinator-only.
+type HybridProtocolU3AggregateRecord struct {
+	WCirc bn254.G1Affine
+	WLaur bn254.G1Affine
+	PiU   bn254.G1Affine
+}
+
 // PackProtocolW0 packs either a party W0 share or the aggregate W0
 // broadcast. Both operations have the same semantic inventory.
 func PackProtocolW0(message OuterW0Message) (MPIPayload, error) {
@@ -362,6 +385,158 @@ func UnpackProtocolU3Broadcast(payload MPIPayload) (U3Message, error) {
 		return U3Message{}, err
 	}
 	return U3Message{WN: validated.G1[0], PiZ: validated.G1[1], PiY: validated.G1[2]}, nil
+}
+
+// PackHybridProtocolU0 packs either a hybrid party U0 share or its aggregate.
+func PackHybridProtocolU0(message HybridU0Message) (MPIPayload, error) {
+	return newTypedProtocolPayload("hybrid U0", nil, message.PartialCommitments[:], MPIPayloadShape{G1: 3})
+}
+
+// UnpackHybridProtocolU0 validates and decodes either hybrid U0 payload.
+func UnpackHybridProtocolU0(payload MPIPayload) (HybridU0Message, error) {
+	validated, err := validateTypedProtocolPayload("hybrid U0", payload, MPIPayloadShape{G1: 3})
+	if err != nil {
+		return HybridU0Message{}, err
+	}
+	var message HybridU0Message
+	copy(message.PartialCommitments[:], validated.G1)
+	return message, nil
+}
+
+// PackHybridProtocolU1Gather packs g_j(alpha_ch) and one S_i^fun
+// commitment share.
+func PackHybridProtocolU1Gather(message HybridProtocolU1GatherRecord) (MPIPayload, error) {
+	return newTypedProtocolPayload(
+		"hybrid U1 gather", message.A[:], []bn254.G1Affine{message.LaurentCommitment},
+		MPIPayloadShape{Fields: 3, G1: 1},
+	)
+}
+
+// UnpackHybridProtocolU1Gather decodes one hybrid U1 worker record.
+func UnpackHybridProtocolU1Gather(payload MPIPayload) (HybridProtocolU1GatherRecord, error) {
+	validated, err := validateTypedProtocolPayload("hybrid U1 gather", payload, MPIPayloadShape{Fields: 3, G1: 1})
+	if err != nil {
+		return HybridProtocolU1GatherRecord{}, err
+	}
+	var message HybridProtocolU1GatherRecord
+	copy(message.A[:], validated.Fields)
+	message.LaurentCommitment = validated.G1[0]
+	return message, nil
+}
+
+// PackHybridProtocolU1Broadcast packs the public hybrid U1 message.
+func PackHybridProtocolU1Broadcast(message HybridU1Message) (MPIPayload, error) {
+	return newTypedProtocolPayload(
+		"hybrid U1 broadcast", message.PartialAtChallenge[:],
+		[]bn254.G1Affine{message.FunctionalCommitment, message.LaurentCommitment},
+		MPIPayloadShape{Fields: 3, G1: 2},
+	)
+}
+
+// UnpackHybridProtocolU1Broadcast decodes public hybrid U1.
+func UnpackHybridProtocolU1Broadcast(payload MPIPayload) (HybridU1Message, error) {
+	validated, err := validateTypedProtocolPayload("hybrid U1 broadcast", payload, MPIPayloadShape{Fields: 3, G1: 2})
+	if err != nil {
+		return HybridU1Message{}, err
+	}
+	var message HybridU1Message
+	copy(message.PartialAtChallenge[:], validated.Fields)
+	message.FunctionalCommitment = validated.G1[0]
+	message.LaurentCommitment = validated.G1[1]
+	return message, nil
+}
+
+// PackHybridProtocolU2Aggregate packs the six circuit cross-values in
+// claim-major order.
+func PackHybridProtocolU2Aggregate(message HybridProtocolU2AggregateRecord) (MPIPayload, error) {
+	fields := make([]fr.Element, 0, 6)
+	for claim := range message.CircuitCrossValues {
+		fields = append(fields, message.CircuitCrossValues[claim][:]...)
+	}
+	return newTypedProtocolPayload("hybrid U2 aggregate", fields, nil, MPIPayloadShape{Fields: 6})
+}
+
+// UnpackHybridProtocolU2Aggregate decodes one hybrid U2 additive share.
+func UnpackHybridProtocolU2Aggregate(payload MPIPayload) (HybridProtocolU2AggregateRecord, error) {
+	validated, err := validateTypedProtocolPayload("hybrid U2 aggregate", payload, MPIPayloadShape{Fields: 6})
+	if err != nil {
+		return HybridProtocolU2AggregateRecord{}, err
+	}
+	var message HybridProtocolU2AggregateRecord
+	offset := 0
+	for claim := range message.CircuitCrossValues {
+		offset += copy(message.CircuitCrossValues[claim][:], validated.Fields[offset:])
+	}
+	return message, nil
+}
+
+// PackHybridProtocolU2Broadcast packs six circuit cross-values followed by
+// four interleaved (beta,beta^-1) functional/Laurent value pairs.
+func PackHybridProtocolU2Broadcast(message HybridU2Message) (MPIPayload, error) {
+	fields := make([]fr.Element, 0, 14)
+	for claim := range message.CircuitCrossValues {
+		fields = append(fields, message.CircuitCrossValues[claim][:]...)
+	}
+	for polynomial := range message.LaurentAtBeta {
+		fields = append(fields, message.LaurentAtBeta[polynomial], message.LaurentAtBetaInverse[polynomial])
+	}
+	return newTypedProtocolPayload("hybrid U2 broadcast", fields, nil, MPIPayloadShape{Fields: 14})
+}
+
+// UnpackHybridProtocolU2Broadcast decodes public hybrid U2.
+func UnpackHybridProtocolU2Broadcast(payload MPIPayload) (HybridU2Message, error) {
+	validated, err := validateTypedProtocolPayload("hybrid U2 broadcast", payload, MPIPayloadShape{Fields: 14})
+	if err != nil {
+		return HybridU2Message{}, err
+	}
+	var message HybridU2Message
+	offset := 0
+	for claim := range message.CircuitCrossValues {
+		offset += copy(message.CircuitCrossValues[claim][:], validated.Fields[offset:])
+	}
+	for polynomial := range message.LaurentAtBeta {
+		message.LaurentAtBeta[polynomial] = validated.Fields[offset]
+		message.LaurentAtBetaInverse[polynomial] = validated.Fields[offset+1]
+		offset += 2
+	}
+	return message, nil
+}
+
+// PackHybridProtocolU3Aggregate packs WCirc, WLaur, PiU.
+func PackHybridProtocolU3Aggregate(message HybridProtocolU3AggregateRecord) (MPIPayload, error) {
+	return newTypedProtocolPayload(
+		"hybrid U3 aggregate", nil, []bn254.G1Affine{message.WCirc, message.WLaur, message.PiU},
+		MPIPayloadShape{G1: 3},
+	)
+}
+
+// UnpackHybridProtocolU3Aggregate decodes the three worker quotient shares.
+func UnpackHybridProtocolU3Aggregate(payload MPIPayload) (HybridProtocolU3AggregateRecord, error) {
+	validated, err := validateTypedProtocolPayload("hybrid U3 aggregate", payload, MPIPayloadShape{G1: 3})
+	if err != nil {
+		return HybridProtocolU3AggregateRecord{}, err
+	}
+	return HybridProtocolU3AggregateRecord{WCirc: validated.G1[0], WLaur: validated.G1[1], PiU: validated.G1[2]}, nil
+}
+
+// PackHybridProtocolU3Broadcast packs WCirc, WLaur, PiU, PiV.
+func PackHybridProtocolU3Broadcast(message HybridU3Message) (MPIPayload, error) {
+	return newTypedProtocolPayload(
+		"hybrid U3 broadcast", nil,
+		[]bn254.G1Affine{message.WCirc, message.WLaur, message.PiU, message.PiV},
+		MPIPayloadShape{G1: 4},
+	)
+}
+
+// UnpackHybridProtocolU3Broadcast decodes public hybrid U3.
+func UnpackHybridProtocolU3Broadcast(payload MPIPayload) (HybridU3Message, error) {
+	validated, err := validateTypedProtocolPayload("hybrid U3 broadcast", payload, MPIPayloadShape{G1: 4})
+	if err != nil {
+		return HybridU3Message{}, err
+	}
+	return HybridU3Message{
+		WCirc: validated.G1[0], WLaur: validated.G1[1], PiU: validated.G1[2], PiV: validated.G1[3],
+	}, nil
 }
 
 func protocolPayloadRoundCount(partitions uint64) (int, error) {

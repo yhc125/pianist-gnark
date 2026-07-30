@@ -228,11 +228,11 @@ func CompiledProve(
 		return CompiledProof{}, fmt.Errorf("%w: outer reduction: %v", ErrInvalidCompiledProverInput, err)
 	}
 	_, t0, t1 := coordinatorState.CoordinatorProductCheckWitness()
-	proof.ProductCheck.Commitments[0], err = setup.Coordinator.SRS.CommitZ(t0)
+	proof.ProductCheck.Commitments[0], err = setup.Coordinator.SRS.CommitU(t0)
 	if err != nil {
 		return CompiledProof{}, fmt.Errorf("%w: t0 commitment: %v", ErrInvalidCompiledProverInput, err)
 	}
-	proof.ProductCheck.Commitments[1], err = setup.Coordinator.SRS.CommitZ(t1)
+	proof.ProductCheck.Commitments[1], err = setup.Coordinator.SRS.CommitU(t1)
 	if err != nil {
 		return CompiledProof{}, fmt.Errorf("%w: t1 commitment: %v", ErrInvalidCompiledProverInput, err)
 	}
@@ -380,7 +380,7 @@ func CompiledProve(
 		mu,
 		openingContext,
 	)
-	openingProof, err := ProveDLinkZGOpening(
+	openingProof, err := ProveHybridOpening(
 		openingInstance,
 		DLinkZGOpeningProverInput{
 			Sources:        sources,
@@ -571,9 +571,9 @@ func CompiledVerify(
 		mu,
 		openingContext,
 	)
-	if err := VerifyDLinkZGOpening(
+	if err := VerifyHybridOpening(
 		openingInstance,
-		DLinkZGOpeningProof{U0: proof.U0, U1: proof.U1, U2: proof.U2, U3: proof.U3},
+		HybridOpeningProof{U0: proof.U0, U1: proof.U1, U2: proof.U2, U3: proof.U3},
 		vk.Verifier.SRS,
 	); err != nil {
 		return compiledVerificationError("DLinKZG opening", err)
@@ -766,7 +766,7 @@ func compiledOpeningInstance(
 			folded.ValuesAt(LocalTerminalPoint(group)), mu[group],
 		)
 	}
-	instance.TranscriptContext = BindDLinkZGOpeningTranscriptContext(instance, context)
+	instance.TranscriptContext = BindHybridOpeningTranscriptContext(instance, context)
 	return instance
 }
 

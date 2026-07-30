@@ -77,10 +77,10 @@ func TestProtocolMPIShapeLedger(t *testing.T) {
 		{ProtocolMPIPhaseU0, protocolMPIOpBroadcast, MPIPayloadShape{G1: 3}},
 		{ProtocolMPIPhaseU1, protocolMPIOpGather, MPIPayloadShape{Fields: 3, G1: 1}},
 		{ProtocolMPIPhaseU1, protocolMPIOpBroadcast, MPIPayloadShape{Fields: 3, G1: 2}},
-		{ProtocolMPIPhaseU2, protocolMPIOpAggregate, MPIPayloadShape{Fields: 7}},
+		{ProtocolMPIPhaseU2, protocolMPIOpAggregate, MPIPayloadShape{Fields: 6}},
 		{ProtocolMPIPhaseU2, protocolMPIOpBroadcast, MPIPayloadShape{Fields: 14}},
-		{ProtocolMPIPhaseU3, protocolMPIOpAggregate, MPIPayloadShape{G1: 2}},
-		{ProtocolMPIPhaseU3, protocolMPIOpBroadcast, MPIPayloadShape{G1: 3}},
+		{ProtocolMPIPhaseU3, protocolMPIOpAggregate, MPIPayloadShape{G1: 3}},
+		{ProtocolMPIPhaseU3, protocolMPIOpBroadcast, MPIPayloadShape{G1: 4}},
 	}
 	for _, partitions := range []uint64{2, 4} {
 		for _, entry := range base {

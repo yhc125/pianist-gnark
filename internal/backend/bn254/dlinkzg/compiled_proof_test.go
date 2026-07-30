@@ -26,10 +26,10 @@ func TestCompiledProofInventoryAndRoundTrip(t *testing.T) {
 				t.Fatalf("element counts: %v", err)
 			}
 			wantFields := 6*(bitsForCompiledProofTest(partitions)-1) + 43
-			if g1Elements != 17 || fieldElements != wantFields {
-				t.Fatalf("inventory = (%d G1, %d Fr), want (17 G1, %d Fr)", g1Elements, fieldElements, wantFields)
+			if g1Elements != 18 || fieldElements != wantFields {
+				t.Fatalf("inventory = (%d G1, %d Fr), want (18 G1, %d Fr)", g1Elements, fieldElements, wantFields)
 			}
-			wantBytes := compiledProofHeaderSize + 17*bn254.SizeOfG1AffineCompressed + wantFields*fr.Bytes
+			wantBytes := compiledProofHeaderSize + 18*bn254.SizeOfG1AffineCompressed + wantFields*fr.Bytes
 			if len(encoded) != wantBytes {
 				t.Fatalf("encoded length = %d, want %d", len(encoded), wantBytes)
 			}
@@ -305,22 +305,24 @@ func compiledProofTestFixture(partitions uint64) CompiledProof {
 	for i := range proof.U0.PartialCommitments {
 		proof.U0.PartialCommitments[i] = point()
 	}
-	for i := range proof.U1.LinkEvaluations {
-		proof.U1.LinkEvaluations[i] = field()
+	for i := range proof.U1.PartialAtChallenge {
+		proof.U1.PartialAtChallenge[i] = field()
 	}
-	proof.U1.LinkCommitment = point()
+	proof.U1.FunctionalCommitment = point()
 	proof.U1.LaurentCommitment = point()
-	for i := range proof.U2.PartialAtBeta {
-		proof.U2.PartialAtBeta[i] = field()
-		proof.U2.PartialAtBetaInverse[i] = field()
+	for claim := range proof.U2.CircuitCrossValues {
+		for cross := range proof.U2.CircuitCrossValues[claim] {
+			proof.U2.CircuitCrossValues[claim][cross] = field()
+		}
 	}
-	for i := range proof.U2.BatchAtBeta {
-		proof.U2.BatchAtBeta[i] = field()
-		proof.U2.BatchAtBetaInverse[i] = field()
+	for i := range proof.U2.LaurentAtBeta {
+		proof.U2.LaurentAtBeta[i] = field()
+		proof.U2.LaurentAtBetaInverse[i] = field()
 	}
-	proof.U3.WN = point()
-	proof.U3.PiZ = point()
-	proof.U3.PiY = point()
+	proof.U3.WCirc = point()
+	proof.U3.WLaur = point()
+	proof.U3.PiU = point()
+	proof.U3.PiV = point()
 	return proof
 }
 

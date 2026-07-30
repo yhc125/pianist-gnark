@@ -556,17 +556,17 @@ func protocolMPIExpectedShape(
 		}
 	case ProtocolMPIPhaseU2:
 		if operation == protocolMPIOpAggregate {
-			return MPIPayloadShape{Fields: 7}, nil
+			return MPIPayloadShape{Fields: 6}, nil
 		}
 		if operation == protocolMPIOpBroadcast {
 			return MPIPayloadShape{Fields: 14}, nil
 		}
 	case ProtocolMPIPhaseU3:
 		if operation == protocolMPIOpAggregate {
-			return MPIPayloadShape{G1: 2}, nil
+			return MPIPayloadShape{G1: 3}, nil
 		}
 		if operation == protocolMPIOpBroadcast {
-			return MPIPayloadShape{G1: 3}, nil
+			return MPIPayloadShape{G1: 4}, nil
 		}
 	}
 	return MPIPayloadShape{}, fmt.Errorf(

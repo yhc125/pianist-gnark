@@ -128,8 +128,15 @@ func initializeMPIWorld(cfg config) error {
 	ipFile := os.Getenv("PIANIST_MPI_IP_FILE")
 	sshKey := os.Getenv("PIANIST_MPI_SSH_KEY")
 	sshUser := os.Getenv("PIANIST_MPI_SSH_USER")
-	if ipFile == "" || sshKey == "" || sshUser == "" {
-		return errors.New("distributed backend needs all PIANIST_MPI_* variables")
+	localLauncher := strings.EqualFold(
+		strings.TrimSpace(os.Getenv("SIMPLEMPI_LAUNCH_MODE")),
+		"local",
+	)
+	if ipFile == "" || (!localLauncher && (sshKey == "" || sshUser == "")) {
+		return errors.New(
+			"distributed backend needs PIANIST_MPI_IP_FILE and, unless " +
+				"SIMPLEMPI_LAUNCH_MODE=local, both PIANIST_MPI_SSH_* variables",
+		)
 	}
 	// The imported Pianist DKZG package normally initialized the root before
 	// main. Calling WorldInit twice relaunches every SSH worker and invalidates
@@ -215,7 +222,7 @@ func expectedDLinKZGRootAccounting(partitions uint64) (payloadSent, payloadRecei
 	}
 	edges := partitions - 1
 	payloadReceived = edges * 1408
-	payloadSent = edges * (1984 + 192*logPartitions)
+	payloadSent = edges * (2016 + 192*logPartitions)
 	// Eight worker-to-root and nine root-to-worker records cross each star
 	// edge. Every ProtocolMPIChannel record has one fixed 20-byte header.
 	wireReceived = payloadReceived + edges*8*dlinkzgProtocolHeaderBytes
